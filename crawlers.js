@@ -7,6 +7,10 @@
 // counted; a request that only claims to be one goes through the guard.
 
 const dns = require('node:dns').promises;
+// c-ares queries with their own timeout: dns.lookup would run in the
+// libuv thread pool, where slow answers to attacker-chosen names hold
+// up the application's file and crypto work too.
+const defaultResolver = () => new dns.Resolver({ timeout: 2000, tries: 1 });
 const net = require('node:net');
 
 const SEARCH_CRAWLERS = [
@@ -21,6 +25,7 @@ const CACHE_MAX = 4096;
 const OK_FOR = 24 * 3600e3;
 const FAIL_FOR = 3600e3;
 const LOOKUP_MAX = 4; // concurrent DNS checks; past it a claim waits for the next request
+const NAMES_MAX = 4; // reverse names followed per address
 const TIMEOUT = 2000;
 
 function claimedCrawler(ua) {
@@ -47,7 +52,7 @@ function remoteIp(req) {
 
 const sameIp = (a, b) => net.isIP(a) && net.isIP(b) && bare(a).toLowerCase() === bare(b).toLowerCase();
 
-function createCrawlerVerifier(clientIp, resolver = dns) {
+function createCrawlerVerifier(clientIp, resolver = defaultResolver()) {
   const seen = new Map(); // address -> { ok, at }
   let inFlight = 0;
 
@@ -55,12 +60,12 @@ function createCrawlerVerifier(clientIp, resolver = dns) {
     if (!net.isIP(addr)) return false;
     let names;
     try { names = await resolver.reverse(addr); } catch { return false; }
-    for (let name of names) {
+    for (let name of names.slice(0, NAMES_MAX)) {
       name = name.toLowerCase().replace(/\.$/, '');
       if (!suffixes.some((s) => name.endsWith(s))) continue;
       let addrs = [];
       try {
-        addrs = (await resolver.lookup(name, { all: true })).map((x) => x.address);
+        addrs = net.isIPv4(bare(addr)) ? await resolver.resolve4(name) : await resolver.resolve6(name);
       } catch { continue; }
       if (addrs.some((a) => sameIp(a, addr))) return true;
     }

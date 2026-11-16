@@ -16,7 +16,8 @@ const fwd = {
 const resolver = {
   calls: 0,
   async reverse(a) { this.calls++; if (rdns[a]) return rdns[a]; throw new Error('no PTR'); },
-  async lookup(h) { if (fwd[h]) return fwd[h].map((address) => ({ address })); throw new Error('no A'); },
+  async resolve4(h) { if (fwd[h]) return fwd[h].filter((a) => !a.includes(':')); throw new Error('no A'); },
+  async resolve6(h) { if (fwd[h]) return fwd[h].filter((a) => a.includes(':')); throw new Error('no AAAA'); },
 };
 const google = 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)';
 const req = (ua, addr, headers = {}) => ({ headers: { 'user-agent': ua, ...headers }, socket: { remoteAddress: addr } });

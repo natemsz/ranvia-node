@@ -27,7 +27,7 @@ const { encodeRequest, decodeDecision } = require('./wire');
 const { createCrawlerVerifier, remoteIp } = require('./crawlers');
 
 const DEFAULT_SERVICE_URL = 'https://ranvia.io';
-const LOADER_VERSION = '0.2.2';
+const LOADER_VERSION = '0.2.3';
 const RULES_EVERY = 5 * 60e3;
 const USAGE_EVERY = 60e3;
 const ENGINE_EVERY = 5 * 60e3; // a conditional fetch: "not modified" unless a new engine is out
@@ -123,6 +123,8 @@ function createRanvia(cfg = {}) {
     path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'), 'ranvia');
   const cacheFile = path.join(cacheDir, 'engine-' + key.id + '.bin');
   let engine = null;
+  let running = null; // the sealed copy the engine was started from
+  let restarting = null;
   let bundle = null;
   let closed = false;
   const timers = [];
@@ -227,11 +229,13 @@ function createRanvia(cfg = {}) {
   }
 
   async function refreshRules() {
-    const v = engine.rulesVersion();
+    if (!engine) return;
+    const e = engine;
+    const v = e.rulesVersion();
     const res = await service('GET', '/v1/rules', null, v ? '"' + v + '"' : '');
     if (res.status === 304) return;
     if (res.status !== 200) throw new Error('ranvia: rules: service answered ' + res.status);
-    engine.bundle(res.body);
+    e.bundle(res.body);
     bundle = res.body;
   }
 
@@ -262,6 +266,7 @@ function createRanvia(cfg = {}) {
       try {
         const { sealed } = await fetchEngine();
         engine = await load(sealed);
+        running = sealed;
         log('ranvia: engine running');
       } catch (err) {
         log(err.message + '; passing requests until the engine loads');
@@ -272,26 +277,57 @@ function createRanvia(cfg = {}) {
     if (closed) return;
     try { await refreshRules(); } catch (err) { log(err.message); }
     every(RULES_EVERY, refreshRules);
-    every(USAGE_EVERY, async () => { engine.tick(); await reportUsage(); });
+    every(USAGE_EVERY, async () => { if (!engine) return; engine.tick(); await reportUsage(); });
     every(ENGINE_EVERY, async () => {
       const { sealed, changed } = await fetchEngine();
-      if (!changed) return;
+      if (!changed && (engine || restarting)) return; // unchanged, or a failed restart to retry
       const next = await load(sealed);
       const old = engine;
       engine = next;
+      running = sealed;
       await reportUsage(old);
       log('ranvia: engine updated');
     });
   })();
 
+  // readBody reads the check's answer (at most 1 KiB). A body parser
+  // that ran first has it already; a body already read, or one that
+  // never finishes, is no answer rather than a request left hanging.
   function readBody(req) {
+    if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) {
+      return Promise.resolve(new URLSearchParams(req.body).toString().slice(0, 1024));
+    }
+    if (typeof req.body === 'string' || Buffer.isBuffer(req.body)) {
+      return Promise.resolve(String(req.body).slice(0, 1024));
+    }
+    if (req.readableEnded || req.complete) return Promise.resolve('');
     return new Promise((resolve) => {
       const chunks = [];
       let size = 0;
+      const done = (s) => { clearTimeout(timer); resolve(s); };
+      const timer = setTimeout(() => done(''), 5000);
       req.on('data', (c) => { if (size < 1024) { chunks.push(c); size += c.length; } });
-      req.on('end', () => resolve(Buffer.concat(chunks).subarray(0, 1024).toString('utf8')));
-      req.on('error', () => resolve(''));
+      req.on('end', () => done(Buffer.concat(chunks).subarray(0, 1024).toString('utf8')));
+      req.on('error', () => done(''));
+      req.on('close', () => done(''));
     });
+  }
+
+  // restart replaces an engine that failed a call (a trapped module
+  // stays broken) with a fresh copy of the same one.
+  function restart(broken) {
+    if (engine !== broken || restarting || !running) return;
+    engine = null;
+    restarting = (async () => {
+      try {
+        engine = await load(running);
+        log('ranvia: engine restarted');
+      } catch (err) {
+        log(err.message + '; passing requests until the engine loads');
+      } finally {
+        restarting = null;
+      }
+    })();
   }
 
   // handle decides one request: true when the site should serve it.
@@ -311,7 +347,8 @@ function createRanvia(cfg = {}) {
     try {
       d = e.decide(r);
     } catch (err) {
-      log(err.message + '; passing the request');
+      log(err.message + '; restarting the engine');
+      restart(e);
       return true;
     }
     for (const [k, v] of d.header) res.appendHeader(k, v);
