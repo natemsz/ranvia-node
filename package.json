@@ -1,0 +1,35 @@
+{
+  "name": "ranvia",
+  "version": "0.2.2",
+  "description": "Bot and AI scraper protection that runs on your own server: middleware for Express, Connect and node:http.",
+  "keywords": [
+    "bot",
+    "scraper",
+    "ai",
+    "crawler",
+    "protection",
+    "security",
+    "middleware",
+    "express"
+  ],
+  "homepage": "https://ranvia.io",
+  "license": "SEE LICENSE IN README.md",
+  "author": "Synap6",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "wasi.js",
+    "wire.js",
+    "crawlers.js",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/natemsz/ranvia-node.git"
+  }
+}

@@ -1,0 +1,30 @@
+# Publishes the npm package `ranvia` when a v<version> tag is pushed.
+# It uses npm trusted publishing: GitHub's OIDC identity, no token.
+# This repository is a mirror of loaders/node in Ranvia's main repo;
+# `ranvia loaders <version>` syncs and tags it.
+name: publish
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  npm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Check the tag matches the package version
+        run: test "v$(node -p "require('./package.json').version")" = "$GITHUB_REF_NAME"
+      - run: node --test test/crawlers.test.js
+      - name: Publish
+        run: |
+          tag=latest; case "$GITHUB_REF_NAME" in *-*) tag=next ;; esac
+          npm publish --provenance --access public --tag "$tag"
