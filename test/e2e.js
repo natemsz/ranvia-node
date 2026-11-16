@@ -33,6 +33,16 @@ const browser = (extra) => Object.assign({
     log: (l) => logs.push(l),
   });
   const server = http.createServer(ranvia.wrap((req, res) => {
+    if (req.url.endsWith('/missing.css')) {
+      res.writeHead(404, { 'Content-Type': 'text/html' });
+      res.end('not found');
+      return;
+    }
+    if (req.url.endsWith('.css')) {
+      res.setHeader('Content-Type', 'text/css');
+      res.end('body{}');
+      return;
+    }
     res.setHeader('Content-Type', 'text/html');
     res.end('<p>the site');
   }));
@@ -50,7 +60,10 @@ const browser = (extra) => Object.assign({
   const other = await get(port, '/market/', browser({ 'Accept-Language': 'fr' }));
   out.other = [other.status, other.body];
 
-  const asset = await get(port, '/static/site.css', browser({ 'Accept-Language': 'pt', 'Sec-Fetch-Dest': 'style', 'Sec-Fetch-Mode': 'no-cors' }));
+  const assetHeaders = browser({ 'Accept-Language': 'pt', 'Sec-Fetch-Dest': 'style', 'Sec-Fetch-Mode': 'no-cors' });
+  const missing = await get(port, '/static/missing.css', assetHeaders);
+  out.missingCookie = !!missing.headers['set-cookie'];
+  const asset = await get(port, '/assets/site.css', assetHeaders);
   const cookie = String((asset.headers['set-cookie'] || [''])[0]).split(';')[0];
   out.passCookie = cookie.startsWith('es_assets=');
   const n = 2000;

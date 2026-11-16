@@ -41,7 +41,7 @@ function decodeDecision(buf) {
     return s;
   };
   need(13);
-  const d = { serve: buf[0] === 1, sniff: buf.readBigUInt64LE(1), status: buf.readUInt16LE(9), header: [] };
+  const d = { serve: (buf[0] & 1) === 1, confirm: (buf[0] & 2) === 2, sniff: buf.readBigUInt64LE(1), status: buf.readUInt16LE(9), header: [] };
   const lines = buf.readUInt16LE(11); o = 13;
   for (let i = 0; i < lines; i++) d.header.push([str().toString('utf8'), str().toString('utf8')]);
   d.body = Buffer.from(str());

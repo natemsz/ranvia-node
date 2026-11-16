@@ -27,7 +27,7 @@ const { encodeRequest, decodeDecision } = require('./wire');
 const { createCrawlerVerifier, remoteIp } = require('./crawlers');
 
 const DEFAULT_SERVICE_URL = 'https://ranvia.io';
-const LOADER_VERSION = '0.2.3';
+const LOADER_VERSION = '0.3.0';
 const RULES_EVERY = 5 * 60e3;
 const USAGE_EVERY = 60e3;
 const ENGINE_EVERY = 5 * 60e3; // a conditional fetch: "not modified" unless a new engine is out
@@ -52,6 +52,9 @@ class Engine {
     memory = instance.exports.memory;
     instance.exports._initialize();
     const e = new Engine(instance.exports);
+    // Engines from 0.3.0 confirm assets on the response: say this
+    // loader will (see the writeHead hook in handle).
+    if (instance.exports.ranvia_confirm) config = { ...config, confirm_assets: true };
     const err = JSON.parse(e.call('ranvia_init', Buffer.from(JSON.stringify(config))).toString() || '{}').error;
     if (err) throw new Error('ranvia: ' + err);
     return e;
@@ -89,6 +92,23 @@ class Engine {
 
   served(id, html) {
     this.x.ranvia_served(id, html ? 1 : 0);
+  }
+
+  // confirm answers a Confirm decision with the response's status and
+  // Content-Type; it returns the Set-Cookie value to add, '' for none.
+  confirm(id, status, contentType) {
+    const x = this.x;
+    if (!x.ranvia_confirm) return '';
+    const input = Buffer.from(contentType || ' ');
+    const ptr = x.ranvia_alloc(input.length);
+    try {
+      new Uint8Array(x.memory.buffer, ptr, input.length).set(input);
+      const res = BigInt.asUintN(64, BigInt(x.ranvia_confirm(BigInt(id), status, ptr, input.length) ?? 0));
+      if (res === 0n) return '';
+      return Buffer.from(new Uint8Array(x.memory.buffer, Number(res >> 32n), Number(res & 0xffffffffn))).toString('utf8');
+    } finally {
+      x.ranvia_free(ptr);
+    }
   }
 
   bundle(raw) {
@@ -151,7 +171,7 @@ function createRanvia(cfg = {}) {
     const engine = urlPath === '/v1/engine';
     if (engine) headers['Ranvia-Engine-Encoding'] = 'gzip';
     const res = await fetch(base + urlPath, { method, headers, body, signal: AbortSignal.timeout(engine ? 600e3 : 30e3) });
-    return { status: res.status, body: Buffer.from(await res.arrayBuffer()), etag: res.headers.get('etag') || '' };
+    return { status: res.status, body: Buffer.from(await res.arrayBuffer()), etag: res.headers.get('etag') || '', headers: res.headers };
   }
 
   // open unseals the site's engine copy, in memory only.
@@ -175,22 +195,36 @@ function createRanvia(cfg = {}) {
   async function readCache() {
     try {
       const sealed = await fs.readFile(cacheFile);
-      const etag = (await fs.readFile(cacheFile + '.etag', 'utf8').catch(() => '')).trim();
-      return { sealed, etag };
+      // The ETag, then (from 0.3.0) the copy's issue time.
+      const [etag = '', issued = '0'] = (await fs.readFile(cacheFile + '.etag', 'utf8').catch(() => '')).trim().split('\n');
+      return { sealed, etag: etag.trim(), issued: Number(issued) || 0 };
     } catch {
-      return { sealed: null, etag: '' };
+      return { sealed: null, etag: '', issued: 0 };
     }
   }
 
-  async function writeCache(sealed, etag) {
+  async function writeCache(sealed, etag, issued) {
     try {
       await fs.mkdir(cacheDir, { recursive: true, mode: 0o700 });
       await fs.writeFile(cacheFile + '.tmp', sealed, { mode: 0o600 });
       await fs.rename(cacheFile + '.tmp', cacheFile);
-      await fs.writeFile(cacheFile + '.etag', etag, { mode: 0o600 });
+      await fs.writeFile(cacheFile + '.etag', etag + '\n' + String(issued || 0), { mode: 0o600 });
     } catch (err) {
       log('ranvia: cache: ' + err.message);
     }
+  }
+
+  // checkIssue checks a downloaded copy's issue tag
+  // (Ranvia-Engine-Tag) and returns its issue time, null if invalid.
+  function checkIssue(headers, sealed) {
+    const issued = headers && headers.get('ranvia-engine-issued');
+    const tag = headers && headers.get('ranvia-engine-tag');
+    if (!issued || !/^[0-9]+$/.test(issued) || !tag) return null;
+    const sealKey = crypto.createHmac('sha256', key.secret).update('ranvia engine key').digest();
+    const sum = crypto.createHash('sha256').update(sealed).digest('hex');
+    const want = crypto.createHmac('sha256', sealKey).update('ranvia engine tag|' + key.id + '|' + issued + '|' + sum).digest('hex');
+    if (want.length !== tag.length || !crypto.timingSafeEqual(Buffer.from(want), Buffer.from(tag))) return null;
+    return Number(issued);
   }
 
   // fetchEngine returns the sealed engine: the service's copy when it
@@ -208,8 +242,17 @@ function createRanvia(cfg = {}) {
       throw new Error('ranvia: engine download: ' + err.message);
     }
     if (res.status === 200) {
-      await writeCache(res.body, res.etag);
-      return { sealed: res.body, changed: true };
+      // Only a copy the service tagged, issued no earlier than the one
+      // cached: a replayed old copy (an engine with since-fixed gaps)
+      // is refused.
+      const issued = checkIssue(res.headers, res.body);
+      if (issued !== null && issued >= cached.issued) {
+        await writeCache(res.body, res.etag, issued);
+        return { sealed: res.body, changed: true };
+      }
+      log('ranvia: the service\'s engine copy has no valid issue tag, or is older than the cached one');
+      if (cached.sealed) return { sealed: cached.sealed, changed: false };
+      throw new Error('ranvia: engine download: no valid issue tag');
     }
     if (cached.sealed) {
       if (res.status !== 304) log('ranvia: engine check: service answered ' + res.status + '; using the cached copy');
@@ -359,6 +402,28 @@ function createRanvia(cfg = {}) {
       res.statusCode = d.status || 200;
       res.end(d.body);
       return false;
+    }
+    if (d.sniff && d.confirm) {
+      // Just before the headers go out (an explicit writeHead, or the
+      // implicit one Node runs on the first write or end).
+      const writeHead = res.writeHead;
+      res.writeHead = function (status, ...rest) {
+        res.writeHead = writeHead;
+        if (status >= 200) {
+          let ct = res.getHeader('content-type');
+          for (const a of rest) {
+            if (a && typeof a === 'object' && !Array.isArray(a)) {
+              for (const k of Object.keys(a)) if (k.toLowerCase() === 'content-type') ct = a[k];
+            }
+          }
+          try {
+            const c = e.confirm(d.sniff, status, String(ct || ''));
+            if (c) res.appendHeader('Set-Cookie', c);
+          } catch { /* engine replaced */ }
+        }
+        return writeHead.call(this, status, ...rest);
+      };
+      return true;
     }
     if (d.sniff) {
       res.once('finish', () => {
