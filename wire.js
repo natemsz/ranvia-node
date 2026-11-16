@@ -20,7 +20,7 @@ function encodeRequest(req) {
   const out = Buffer.allocUnsafe(size);
   let o = 0;
   out[o++] = 1;
-  out[o++] = (req.signedIn ? 1 : 0) | (req.crawler ? 2 : 0);
+  out[o++] = (req.signedIn ? 1 : 0) | (req.crawler ? 2 : 0) | (req.tls ? 4 : 0);
   const put = (b) => { out.writeUInt32LE(b.length, o); o += 4; b.copy(out, o); o += b.length; };
   for (const b of bufs) put(b);
   out.writeUInt16LE(n, o); o += 2;

@@ -21,10 +21,12 @@ http.createServer(ranvia.wrap(handler));    // plain node:http
 - **Your traffic never leaves your server.** Every decision is made
   locally, in about a tenth of a millisecond.
 - **What the service sends and receives:** it sends your site's rules
-  and what other sites learned; your site sends back counts and, for
-  requests it turned away, keyed hashes of the browser's headers and
-  family with the network's ASN. Visitor addresses, cookies, URLs and
-  page content are never sent. See https://ranvia.io/privacy.
+  and what other sites learned; your site sends back counts, per-ASN
+  check pass/fail and failed crawler-claim counts, and keyed hashes of
+  the browser's headers and family (with the ASN, plus a network-free
+  template hash for confirmed automated refusals) for turned-away
+  traffic. Visitor addresses, cookies, URLs and page content are never
+  sent. See https://ranvia.io/privacy.
 - **This package is a loader.** On first start it downloads the Ranvia
   engine for your site key, keeps it on disk encrypted for your site,
   and runs it in memory as WebAssembly.

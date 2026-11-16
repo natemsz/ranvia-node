@@ -27,7 +27,7 @@ const { encodeRequest, decodeDecision } = require('./wire');
 const { createCrawlerVerifier, remoteIp } = require('./crawlers');
 
 const DEFAULT_SERVICE_URL = 'https://ranvia.io';
-const LOADER_VERSION = '0.3.0';
+const LOADER_VERSION = '0.3.1';
 const RULES_EVERY = 5 * 60e3;
 const USAGE_EVERY = 60e3;
 const ENGINE_EVERY = 5 * 60e3; // a conditional fetch: "not modified" unless a new engine is out
@@ -223,7 +223,9 @@ function createRanvia(cfg = {}) {
     const sealKey = crypto.createHmac('sha256', key.secret).update('ranvia engine key').digest();
     const sum = crypto.createHash('sha256').update(sealed).digest('hex');
     const want = crypto.createHmac('sha256', sealKey).update('ranvia engine tag|' + key.id + '|' + issued + '|' + sum).digest('hex');
-    if (want.length !== tag.length || !crypto.timingSafeEqual(Buffer.from(want), Buffer.from(tag))) return null;
+    const a = Buffer.from(want, 'utf8');
+    const b = Buffer.from(String(tag), 'utf8');
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
     return Number(issued);
   }
 
@@ -380,6 +382,7 @@ function createRanvia(cfg = {}) {
     const r = {
       method: req.method, uri: req.originalUrl || req.url, host: req.headers.host || '',
       header: req.headers, proto: req.httpVersion ? 'HTTP/' + req.httpVersion : '',
+      tls: !!(req.socket && req.socket.encrypted),
     };
     if (req.method === 'POST' && (req.url || '').split('?')[0] === '/guard/verify') r.body = await readBody(req);
     if (cfg.network) r.network = cfg.network(req) || '';
@@ -406,22 +409,85 @@ function createRanvia(cfg = {}) {
     if (d.sniff && d.confirm) {
       // Just before the headers go out (an explicit writeHead, or the
       // implicit one Node runs on the first write or end).
-      const writeHead = res.writeHead;
+      const origWriteHead = res.writeHead;
+      const origWrite = res.write;
+      const origEnd = res.end;
+      let firstBody = '';
+      const restore = () => {
+        res.writeHead = origWriteHead;
+        res.write = origWrite;
+        res.end = origEnd;
+      };
+      const sniffChunk = (chunk) => {
+        if (!firstBody && chunk != null && typeof chunk !== 'function') {
+          firstBody = (Buffer.isBuffer(chunk) ? chunk.subarray(0, 512).toString('utf8') : String(chunk).slice(0, 512));
+        }
+      };
+      res.write = function (chunk, ...args) {
+        sniffChunk(chunk);
+        return origWrite.call(this, chunk, ...args);
+      };
+      res.end = function (chunk, ...args) {
+        if (typeof chunk !== 'function') sniffChunk(chunk);
+        try {
+          return origEnd.call(this, chunk, ...args);
+        } finally {
+          restore();
+        }
+      };
       res.writeHead = function (status, ...rest) {
-        res.writeHead = writeHead;
         if (status >= 200) {
+          restore();
           let ct = res.getHeader('content-type');
-          for (const a of rest) {
-            if (a && typeof a === 'object' && !Array.isArray(a)) {
-              for (const k of Object.keys(a)) if (k.toLowerCase() === 'content-type') ct = a[k];
+          let hdrIdx = -1;
+          for (let i = 0; i < rest.length; i++) {
+            const a = rest[i];
+            if (a && typeof a === 'object') {
+              hdrIdx = i;
+              if (Array.isArray(a)) {
+                if (Array.isArray(a[0])) {
+                  for (const pair of a) {
+                    if (Array.isArray(pair) && String(pair[0]).toLowerCase() === 'content-type') ct = pair[1];
+                  }
+                } else {
+                  for (let j = 0; j + 1 < a.length; j += 2) {
+                    if (String(a[j]).toLowerCase() === 'content-type') ct = a[j + 1];
+                  }
+                }
+              } else {
+                for (const k of Object.keys(a)) {
+                  if (k.toLowerCase() === 'content-type') ct = a[k];
+                }
+              }
             }
+          }
+          if (!ct && firstBody && /^\s*(?:<!doctype\s+html|<html\b|<head\b|<body\b)/i.test(firstBody)) {
+            ct = 'text/html';
           }
           try {
             const c = e.confirm(d.sniff, status, String(ct || ''));
-            if (c) res.appendHeader('Set-Cookie', c);
+            if (c) {
+              if (hdrIdx >= 0) {
+                const arg = rest[hdrIdx];
+                if (Array.isArray(arg)) {
+                  rest[hdrIdx] = Array.isArray(arg[0]) ? [...arg, ['Set-Cookie', c]] : [...arg, 'Set-Cookie', c];
+                } else {
+                  const copy = { ...arg };
+                  const scKey = Object.keys(copy).find((k) => k.toLowerCase() === 'set-cookie');
+                  if (scKey) {
+                    copy[scKey] = Array.isArray(copy[scKey]) ? [...copy[scKey], c] : [copy[scKey], c];
+                  } else {
+                    copy['Set-Cookie'] = c;
+                  }
+                  rest[hdrIdx] = copy;
+                }
+              } else {
+                res.appendHeader('Set-Cookie', c);
+              }
+            }
           } catch { /* engine replaced */ }
         }
-        return writeHead.call(this, status, ...rest);
+        return origWriteHead.call(this, status, ...rest);
       };
       return true;
     }
