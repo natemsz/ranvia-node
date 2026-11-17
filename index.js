@@ -27,7 +27,7 @@ const { encodeRequest, decodeDecision } = require('./wire');
 const { createCrawlerVerifier, remoteIp } = require('./crawlers');
 
 const DEFAULT_SERVICE_URL = 'https://ranvia.io';
-const LOADER_VERSION = '0.3.1';
+const LOADER_VERSION = '0.3.2';
 const RULES_EVERY = 5 * 60e3;
 const USAGE_EVERY = 60e3;
 const ENGINE_EVERY = 5 * 60e3; // a conditional fetch: "not modified" unless a new engine is out
@@ -379,9 +379,19 @@ function createRanvia(cfg = {}) {
   async function handle(req, res) {
     const e = engine;
     if (!e) return true;
+    // Forwarded headers are trusted only from a loopback peer (the
+    // local proxy in front), as in the Go loader; a direct client
+    // must not assert its own scheme or address.
+    let header = req.headers;
+    const peer = String((req.socket && req.socket.remoteAddress) || '').replace(/^::ffff:/, '');
+    if (!(peer === '::1' || peer.startsWith('127.'))) {
+      header = { ...req.headers };
+      delete header['x-forwarded-proto'];
+      delete header['x-forwarded-for'];
+    }
     const r = {
       method: req.method, uri: req.originalUrl || req.url, host: req.headers.host || '',
-      header: req.headers, proto: req.httpVersion ? 'HTTP/' + req.httpVersion : '',
+      header, proto: req.httpVersion ? 'HTTP/' + req.httpVersion : '',
       tls: !!(req.socket && req.socket.encrypted),
     };
     if (req.method === 'POST' && (req.url || '').split('?')[0] === '/guard/verify') r.body = await readBody(req);

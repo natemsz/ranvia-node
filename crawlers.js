@@ -18,6 +18,7 @@ const SEARCH_CRAWLERS = [
   ['google-inspectiontool', ['.googlebot.com', '.google.com']],
   ['bingbot', ['.search.msn.com']],
   ['applebot', ['.applebot.apple.com']],
+  ['duckduckbot', ['.duckduckgo.com']],
   ['yandexbot', ['.yandex.ru', '.yandex.net', '.yandex.com']],
 ];
 
@@ -31,7 +32,7 @@ const TIMEOUT = 2000;
 function claimedCrawler(ua) {
   if (!ua) return null;
   ua = String(ua).toLowerCase();
-  for (const [token, suffixes] of SEARCH_CRAWLERS) if (ua.includes(token)) return suffixes;
+  for (const [token, suffixes] of SEARCH_CRAWLERS) if (ua.includes(token)) return [token, suffixes];
   return null;
 }
 
@@ -73,11 +74,14 @@ function createCrawlerVerifier(clientIp, resolver = defaultResolver()) {
   }
 
   return async function verified(req) {
-    const suffixes = claimedCrawler(req.headers['user-agent']);
-    if (!suffixes) return false;
+    const claimed = claimedCrawler(req.headers['user-agent']);
+    if (!claimed) return false;
+    const [token, suffixes] = claimed;
     const addr = clientIp(req);
+    // Cache per claimed crawler as well as address, as in Go.
+    const cacheKey = addr + '|' + token;
     const now = Date.now();
-    const got = seen.get(addr);
+    const got = seen.get(cacheKey);
     if (got && now - got.at < (got.ok ? OK_FOR : FAIL_FOR)) return got.ok;
     if (inFlight >= LOOKUP_MAX) return false;
     inFlight++;
@@ -93,7 +97,7 @@ function createCrawlerVerifier(clientIp, resolver = defaultResolver()) {
       inFlight--;
     }
     if (seen.size >= CACHE_MAX) seen.delete(seen.keys().next().value);
-    seen.set(addr, { ok, at: now });
+    seen.set(cacheKey, { ok, at: now });
     return ok;
   };
 }
