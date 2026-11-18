@@ -27,7 +27,7 @@ const { encodeRequest, decodeDecision } = require('./wire');
 const { createCrawlerVerifier, remoteIp } = require('./crawlers');
 
 const DEFAULT_SERVICE_URL = 'https://ranvia.io';
-const LOADER_VERSION = '0.3.3';
+const LOADER_VERSION = '0.3.4';
 const RULES_EVERY = 5 * 60e3;
 const USAGE_EVERY = 60e3;
 const ENGINE_EVERY = 5 * 60e3; // a conditional fetch: "not modified" unless a new engine is out
@@ -498,6 +498,45 @@ function createRanvia(cfg = {}) {
           } catch { /* engine replaced */ }
         }
         return origWriteHead.call(this, status, ...rest);
+      };
+      return true;
+    }
+    if (d.prove) {
+      // Silent first-visit proof: buffer the page, put the proof
+      // tag before </body>, then report it served as the sniff does.
+      const chunks = [];
+      let size = 0;
+      const origWrite = res.write;
+      const origEnd = res.end;
+      res.write = function (chunk, ...args) {
+        if (chunk != null && typeof chunk !== 'function') {
+          const b = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+          size += b.length;
+          if (size <= 8 * 1024 * 1024) { chunks.push(b); return true; }
+        }
+        return origWrite.call(this, chunk, ...args);
+      };
+      res.end = function (chunk, ...args) {
+        res.write = origWrite;
+        res.end = origEnd;
+        if (chunk != null && typeof chunk !== 'function') {
+          const b = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+          size += b.length;
+          if (size <= 8 * 1024 * 1024) chunks.push(b);
+        }
+        let body = Buffer.concat(chunks);
+        const ct = String(res.getHeader('content-type') || '');
+        const html = /^text\/html/i.test(ct);
+        if (html) {
+          const text = body.toString('utf8');
+          const i = text.toLowerCase().lastIndexOf('</body>');
+          if (i >= 0) {
+            body = Buffer.from(text.slice(0, i) + d.prove + text.slice(i));
+            try { res.setHeader('content-length', String(body.length)); } catch { /* headers already sent */ }
+          }
+        }
+        try { e.served(d.sniff, html); } catch { /* engine replaced */ }
+        return origEnd.call(this, body, ...args);
       };
       return true;
     }
