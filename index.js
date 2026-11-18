@@ -27,7 +27,7 @@ const { encodeRequest, decodeDecision } = require('./wire');
 const { createCrawlerVerifier, remoteIp } = require('./crawlers');
 
 const DEFAULT_SERVICE_URL = 'https://ranvia.io';
-const LOADER_VERSION = '0.3.2';
+const LOADER_VERSION = '0.3.3';
 const RULES_EVERY = 5 * 60e3;
 const USAGE_EVERY = 60e3;
 const ENGINE_EVERY = 5 * 60e3; // a conditional fetch: "not modified" unless a new engine is out
@@ -394,7 +394,7 @@ function createRanvia(cfg = {}) {
       header, proto: req.httpVersion ? 'HTTP/' + req.httpVersion : '',
       tls: !!(req.socket && req.socket.encrypted),
     };
-    if (req.method === 'POST' && (req.url || '').split('?')[0] === '/guard/verify') r.body = await readBody(req);
+    if (req.method === 'POST' && (req.url || '').split('?')[0].startsWith('/guard/')) r.body = await readBody(req);
     if (cfg.network) r.network = cfg.network(req) || '';
     r.bind = addressBlock(clientIp(req));
     r.crawler = !!(await verifiedCrawler(req));

@@ -2,21 +2,33 @@
 // Driven by the service's end-to-end test (service/internal/e2e): a
 // node:http site behind the loader, asked the same things as the Go
 // loader's test. Prints one JSON line of results.
+const crypto = require('node:crypto');
 const http = require('node:http');
 const { createRanvia } = require('..');
 
 const chrome = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36';
 
-function get(port, path, headers) {
+function req(port, method, path, headers, body) {
   return new Promise((resolve, reject) => {
-    const req = http.request({ port, path, headers }, (res) => {
+    const r = http.request({ port, method, path, headers }, (res) => {
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
       res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString() }));
     });
-    req.on('error', reject);
-    req.end();
+    r.on('error', reject);
+    if (body) r.write(body);
+    r.end();
   });
+}
+
+function get(port, path, headers) {
+  return req(port, 'GET', path, headers);
+}
+
+function solvePow8(nonce) {
+  for (let n = 0; ; n++) {
+    if (crypto.createHash('sha256').update(`${nonce}:0:${n}`).digest()[0] === 0) return String(n);
+  }
 }
 
 const browser = (extra) => Object.assign({
@@ -64,13 +76,26 @@ const browser = (extra) => Object.assign({
   const missing = await get(port, '/static/missing.css', assetHeaders);
   out.missingCookie = !!missing.headers['set-cookie'];
   const asset = await get(port, '/assets/site.css', assetHeaders);
-  const cookie = String((asset.headers['set-cookie'] || [''])[0]).split(';')[0];
-  out.passCookie = cookie.startsWith('es_assets=');
+  const assetCookie = String((asset.headers['set-cookie'] || [''])[0]).split(';')[0];
+  out.passCookie = assetCookie.startsWith('es_assets=');
+
+  const nonceMatch = /data-nonce="([^"]+)"/.exec(last.body);
+  const nonce = nonceMatch ? nonceMatch[1] : '';
+  const form = `nonce=${encodeURIComponent(nonce)}&n=${solvePow8(nonce)}&e=0`;
+  const verify = await req(port, 'POST', '/guard/verify', browser({
+    'Accept-Language': 'de',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Dest': 'empty',
+    'Content-Type': 'application/x-www-form-urlencoded',
+    'Content-Length': Buffer.byteLength(form),
+  }), form);
+  const solvedCookie = String((verify.headers['set-cookie'] || [''])[0]).split(';')[0];
+
   const n = 2000;
   const t0 = process.hrtime.bigint();
   let okCount = 0;
   for (let i = 0; i < n; i++) {
-    const r = await get(port, '/market/', browser({ 'Accept-Language': 'pt', Cookie: cookie }));
+    const r = await get(port, '/market/', browser({ 'Accept-Language': 'de', Cookie: solvedCookie }));
     if (r.status === 200) okCount++;
   }
   out.passHolderOK = okCount;
