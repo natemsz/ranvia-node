@@ -14,7 +14,8 @@ function encodeRequest(req) {
   const pairs = lines.slice(0, n).map(([k, v]) => [Buffer.from(k, 'utf8'), Buffer.from(v, 'utf8')]);
   const proto = Buffer.from(req.proto || '', 'utf8');
   const bind = Buffer.from(req.bind || '', 'utf8');
-  let size = 2 + 2 + 4 + proto.length + 4 + bind.length;
+  const addr = Buffer.from(req.addr || '', 'utf8');
+  let size = 2 + 2 + 4 + proto.length + 4 + bind.length + 4 + addr.length;
   for (const b of bufs) size += 4 + b.length;
   for (const [k, v] of pairs) size += 8 + k.length + v.length;
   const out = Buffer.allocUnsafe(size);
@@ -27,6 +28,7 @@ function encodeRequest(req) {
   for (const [k, v] of pairs) { put(k); put(v); }
   put(proto); // added after the first engines, which stop before it
   put(bind); // likewise, after proto
+  put(addr); // likewise, after bind
   return out;
 }
 

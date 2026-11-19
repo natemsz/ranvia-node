@@ -23,6 +23,8 @@ export interface RanviaConfig {
    * CDN, return the address it passes on (for Cloudflare, CF-Connecting-IP).
    */
   clientIp?: (req: IncomingMessage) => string;
+  /** A header your edge always sets with the visitor's JA4 TLS fingerprint (for Cloudflare, one you fill from cf.bot_management.ja4). */
+  ja4Header?: string;
   /**
    * Log every request Ranvia refuses, checks or rate-limits through `log`:
    * method, path, User-Agent and the reason. The log stays on your server.

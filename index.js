@@ -27,7 +27,7 @@ const { encodeRequest, decodeDecision } = require('./wire');
 const { createCrawlerVerifier, remoteIp } = require('./crawlers');
 
 const DEFAULT_SERVICE_URL = 'https://ranvia.io';
-const LOADER_VERSION = '0.3.4';
+const LOADER_VERSION = '0.4.0';
 const RULES_EVERY = 5 * 60e3;
 const USAGE_EVERY = 60e3;
 const ENGINE_EVERY = 5 * 60e3; // a conditional fetch: "not modified" unless a new engine is out
@@ -92,6 +92,18 @@ class Engine {
 
   served(id, html) {
     this.x.ranvia_served(id, html ? 1 : 0);
+  }
+
+  // robots hands the engine the robots.txt that just went out (engines
+  // from 0.4.0 read it for robots.txt violations).
+  // markdown converts a page with the engine (engines from 0.4.0).
+  markdown(page) {
+    if (!this.x.ranvia_markdown || !page.length) return Buffer.alloc(0);
+    return this.call('ranvia_markdown', page);
+  }
+
+  robots(body) {
+    if (this.x.ranvia_robots && body.length) this.call('ranvia_robots', body);
   }
 
   // confirm answers a Confirm decision with the response's status and
@@ -389,6 +401,14 @@ function createRanvia(cfg = {}) {
       delete header['x-forwarded-proto'];
       delete header['x-forwarded-for'];
     }
+    // The JA4 the engine reads comes from a trusted edge, never from
+    // the client.
+    if (header['ranvia-ja4'] !== undefined || cfg.ja4Header) {
+      if (header === req.headers) header = { ...req.headers };
+      delete header['ranvia-ja4'];
+      const ja4 = cfg.ja4Header ? req.headers[String(cfg.ja4Header).toLowerCase()] : undefined;
+      if (typeof ja4 === 'string' && ja4.length <= 64) header['ranvia-ja4'] = ja4;
+    }
     const r = {
       method: req.method, uri: req.originalUrl || req.url, host: req.headers.host || '',
       header, proto: req.httpVersion ? 'HTTP/' + req.httpVersion : '',
@@ -396,7 +416,9 @@ function createRanvia(cfg = {}) {
     };
     if (req.method === 'POST' && (req.url || '').split('?')[0].startsWith('/guard/')) r.body = await readBody(req);
     if (cfg.network) r.network = cfg.network(req) || '';
-    r.bind = addressBlock(clientIp(req));
+    const ip = clientIp(req);
+    r.bind = addressBlock(ip);
+    r.addr = (ip || '').replace(/^::ffff:(?=\d+\.\d+\.\d+\.\d+$)/, '');
     r.crawler = !!(await verifiedCrawler(req));
     if (cfg.signedIn && req.headers.cookie) r.signedIn = !!(await cfg.signedIn(req));
     let d;
@@ -407,7 +429,11 @@ function createRanvia(cfg = {}) {
       restart(e);
       return true;
     }
-    for (const [k, v] of d.header) res.appendHeader(k, v);
+    let markdown = false;
+    for (const [k, v] of d.header) {
+      if (k.toLowerCase() === 'ranvia-markdown') { markdown = true; continue; }
+      res.appendHeader(k, v);
+    }
     if (!d.serve) {
       if (cfg.logRefusals && d.reason) {
         log(`ranvia: ${d.reason} ${req.method} ${(req.originalUrl || req.url || '').split('?')[0]} ${JSON.stringify(req.headers['user-agent'] || '')}`);
@@ -501,9 +527,13 @@ function createRanvia(cfg = {}) {
       };
       return true;
     }
-    if (d.prove) {
+    const robots = (req.url || '').split('?')[0] === '/robots.txt';
+    if (d.prove || robots || (markdown && !d.confirm)) {
       // Silent first-visit proof: buffer the page, put the proof
       // tag before </body>, then report it served as the sniff does.
+      // robots.txt is buffered too: the engine may add lines to it,
+      // and reads what went out.
+      const tag = d.prove || '';
       const chunks = [];
       let size = 0;
       const origWrite = res.write;
@@ -527,15 +557,31 @@ function createRanvia(cfg = {}) {
         let body = Buffer.concat(chunks);
         const ct = String(res.getHeader('content-type') || '');
         const html = /^text\/html/i.test(ct);
-        if (html) {
+        const ok = !res.statusCode || res.statusCode === 200;
+        if (html && tag) {
           const text = body.toString('utf8');
           const i = text.toLowerCase().lastIndexOf('</body>');
           if (i >= 0) {
-            body = Buffer.from(text.slice(0, i) + d.prove + text.slice(i));
+            body = Buffer.from(text.slice(0, i) + tag + text.slice(i));
             try { res.setHeader('content-length', String(body.length)); } catch { /* headers already sent */ }
           }
+        } else if (robots && tag && ok && /^text\/plain/i.test(ct)) {
+          body = Buffer.concat([body, Buffer.from(tag)]);
+          try { res.setHeader('content-length', String(body.length)); } catch { /* headers already sent */ }
         }
-        try { e.served(d.sniff, html); } catch { /* engine replaced */ }
+        if (markdown && html && ok) {
+          try {
+            const md = e.markdown(body);
+            if (md.length) {
+              body = md;
+              res.setHeader('content-type', 'text/markdown; charset=utf-8');
+              res.setHeader('content-length', String(body.length));
+              res.appendHeader('vary', 'Accept');
+            }
+          } catch { /* engine replaced: the page goes out as it was */ }
+        }
+        try { if (d.sniff) e.served(d.sniff, html); } catch { /* engine replaced */ }
+        try { if (robots && ok) e.robots(body); } catch { /* engine replaced */ }
         return origEnd.call(this, body, ...args);
       };
       return true;

@@ -46,6 +46,7 @@ http.createServer(ranvia.wrap(handler));    // plain node:http
 | `signedIn(req)` | Return `true` for a visitor you've verified as signed in. They skip the page budget; by default they're asked for proof only past a pace no person browses at (about two pages a second), which you can turn off per site. |
 | `verifiedCrawler(req)` | Search crawlers are checked for you: a request naming Googlebot, Bingbot, Applebot or YandexBot is verified by reverse and forward DNS, and verified crawlers are never counted. Pass your own function to replace the check, or `() => false` to turn it off. |
 | `clientIp(req)` | The visitor's address. Defaults to the connection's address, or the last `X-Forwarded-For` entry when the connection comes from this machine. Behind a CDN, return the address it passes on (`CF-Connecting-IP` for Cloudflare). |
+| `ja4Header` | A header your edge always sets with the visitor's JA4 TLS fingerprint, if it offers one. |
 | `cacheDir` | Where the encrypted engine is kept. Defaults to `~/.cache/ranvia`. |
 | `rulesFile` | A JSON file of your own rule overrides. |
 | `logRefusals` | `true` logs each request Ranvia refuses, checks or rate-limits through `log`: method, path, User-Agent and why. The log stays on your server. |
