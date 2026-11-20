@@ -27,7 +27,7 @@ const { encodeRequest, decodeDecision } = require('./wire');
 const { createCrawlerVerifier, remoteIp } = require('./crawlers');
 
 const DEFAULT_SERVICE_URL = 'https://ranvia.io';
-const LOADER_VERSION = '0.4.1';
+const LOADER_VERSION = '0.4.2';
 const RULES_EVERY = 5 * 60e3;
 const USAGE_EVERY = 60e3;
 const ENGINE_EVERY = 5 * 60e3; // a conditional fetch: "not modified" unless a new engine is out
@@ -409,6 +409,13 @@ function createRanvia(cfg = {}) {
       const ja4 = cfg.ja4Header ? req.headers[String(cfg.ja4Header).toLowerCase()] : undefined;
       if (typeof ja4 === 'string' && ja4.length <= 64) header['ranvia-ja4'] = ja4;
     }
+    // Likewise the HTTP/2 fingerprint.
+    if (header['ranvia-h2'] !== undefined || cfg.h2Header) {
+      if (header === req.headers) header = { ...req.headers };
+      delete header['ranvia-h2'];
+      const h2 = cfg.h2Header ? req.headers[String(cfg.h2Header).toLowerCase()] : undefined;
+      if (typeof h2 === 'string' && h2.length <= 512) header['ranvia-h2'] = h2;
+    }
     const r = {
       method: req.method, uri: req.originalUrl || req.url, host: req.headers.host || '',
       header, proto: req.httpVersion ? 'HTTP/' + req.httpVersion : '',
@@ -529,61 +536,45 @@ function createRanvia(cfg = {}) {
     }
     const robots = (req.url || '').split('?')[0] === '/robots.txt';
     if (d.prove || robots || (markdown && !d.confirm)) {
-      // Silent first-visit proof: buffer the page, put the proof
-      // tag before </body>, then report it served as the sniff does.
-      // robots.txt is buffered too: the engine may add lines to it,
-      // and reads what went out.
+      // The engine's tag goes before </body>: an HTML page streams as
+      // the handler writes it (tagResponse). robots.txt and a page
+      // going out as Markdown are buffered whole: the engine may add
+      // lines to robots.txt, and reads what went out.
       const tag = d.prove || '';
-      const chunks = [];
-      let size = 0;
-      const origWrite = res.write;
-      const origEnd = res.end;
-      res.write = function (chunk, ...args) {
-        if (chunk != null && typeof chunk !== 'function') {
-          const b = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
-          size += b.length;
-          if (size <= 8 * 1024 * 1024) { chunks.push(b); return true; }
-        }
-        return origWrite.call(this, chunk, ...args);
-      };
-      res.end = function (chunk, ...args) {
-        res.write = origWrite;
-        res.end = origEnd;
-        if (chunk != null && typeof chunk !== 'function') {
-          const b = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
-          size += b.length;
-          if (size <= 8 * 1024 * 1024) chunks.push(b);
-        }
-        let body = Buffer.concat(chunks);
-        const ct = String(res.getHeader('content-type') || '');
-        const html = /^text\/html/i.test(ct);
-        const ok = !res.statusCode || res.statusCode === 200;
-        if (html && tag) {
-          const text = body.toString('utf8');
-          const i = text.toLowerCase().lastIndexOf('</body>');
-          if (i >= 0) {
-            body = Buffer.from(text.slice(0, i) + tag + text.slice(i));
-            try { res.setHeader('content-length', String(body.length)); } catch { /* headers already sent */ }
-          }
-        } else if (robots && tag && ok && /^text\/plain/i.test(ct)) {
-          body = Buffer.concat([body, Buffer.from(tag)]);
-          try { res.setHeader('content-length', String(body.length)); } catch { /* headers already sent */ }
-        }
-        if (markdown && html && ok) {
-          try {
-            const md = e.markdown(body);
-            if (md.length) {
-              body = md;
-              res.setHeader('content-type', 'text/markdown; charset=utf-8');
-              res.setHeader('content-length', String(body.length));
-              res.appendHeader('vary', 'Accept');
+      tagResponse(res, {
+        tag,
+        whole: robots || markdown,
+        finish(body, html) {
+          const ok = !res.statusCode || res.statusCode === 200;
+          if (body) {
+            const ct = String(res.getHeader('content-type') || '');
+            if (html && tag) {
+              const tagged = withTag(body, tag);
+              if (tagged !== body) {
+                body = tagged;
+                try { res.setHeader('content-length', String(body.length)); } catch { /* headers already sent */ }
+              }
+            } else if (robots && tag && ok && /^text\/plain/i.test(ct)) {
+              body = Buffer.concat([body, Buffer.from(tag)]);
+              try { res.setHeader('content-length', String(body.length)); } catch { /* headers already sent */ }
             }
-          } catch { /* engine replaced: the page goes out as it was */ }
-        }
-        try { if (d.sniff) e.served(d.sniff, html); } catch { /* engine replaced */ }
-        try { if (robots && ok) e.robots(body); } catch { /* engine replaced */ }
-        return origEnd.call(this, body, ...args);
-      };
+            if (markdown && html && ok) {
+              try {
+                const md = e.markdown(body);
+                if (md.length) {
+                  body = md;
+                  res.setHeader('content-type', 'text/markdown; charset=utf-8');
+                  res.setHeader('content-length', String(body.length));
+                  res.appendHeader('vary', 'Accept');
+                }
+              } catch { /* engine replaced: the page goes out as it was */ }
+            }
+            try { if (robots && ok) e.robots(body); } catch { /* engine replaced */ }
+          }
+          try { if (d.sniff) e.served(d.sniff, html); } catch { /* engine replaced */ }
+          return body;
+        },
+      });
       return true;
     }
     if (d.sniff) {
@@ -621,6 +612,114 @@ function createRanvia(cfg = {}) {
 // addressBlock is an address's /24 (IPv4) or /48 (IPv6), which the
 // engine ties passes to when the site names no network; '' for a
 // loopback, private or unreadable one. It stays on this server.
+// tagResponse wraps res so the engine's tag can go before a page's
+// last </body>. The first write decides: an HTML page with a tag
+// streams as written, holding back only the bytes from the last
+// "</body>" seen (or a few, in case one is split across writes), so a
+// streamed page arrives as it renders; with whole set (robots.txt, a
+// page going out as Markdown) the body is buffered up to 8 MiB and
+// handed to finish, whose return goes out; anything else passes
+// through. finish(body, html) is called once at the end, with a null
+// body when nothing was buffered.
+const BODY_CLOSE = '</body>';
+const BUFFER_MAX = 8 * 1024 * 1024;
+const HOLD_MAX = 64 * 1024;
+
+function lastBodyClose(b) {
+  // latin1 keeps one character per byte, so the index is a byte offset.
+  return b.toString('latin1').toLowerCase().lastIndexOf(BODY_CLOSE);
+}
+
+function withTag(b, tag) {
+  const i = lastBodyClose(b);
+  return i < 0 ? b : Buffer.concat([b.subarray(0, i), Buffer.from(tag), b.subarray(i)]);
+}
+
+function toBuffer(c) {
+  if (Buffer.isBuffer(c)) return c;
+  if (c instanceof Uint8Array) return Buffer.from(c);
+  return Buffer.from(String(c));
+}
+
+function tagResponse(res, { tag, whole, finish }) {
+  const origWrite = res.write;
+  const origEnd = res.end;
+  let mode = ''; // 'stream', 'buffer' or 'pass', set by the first write
+  let html = false;
+  let pending = Buffer.alloc(0);
+  let chunks = [];
+  let size = 0;
+  const isHTML = () => /^text\/html/i.test(String(res.getHeader('content-type') || ''));
+  const decide = () => {
+    if (mode) return;
+    html = isHTML();
+    if (whole) {
+      mode = 'buffer';
+    } else if (html && tag) {
+      mode = 'stream';
+      try { if (!res.headersSent) res.removeHeader('content-length'); } catch { /* headers already sent */ }
+    } else {
+      mode = 'pass';
+    }
+  };
+  const later = (cb) => { if (cb) process.nextTick(cb); };
+  res.write = function (chunk, ...args) {
+    if (chunk == null || typeof chunk === 'function') return origWrite.call(this, chunk, ...args);
+    decide();
+    const cb = typeof args[args.length - 1] === 'function' ? args.pop() : null;
+    const b = toBuffer(chunk);
+    if (mode === 'stream') {
+      pending = pending.length ? Buffer.concat([pending, b]) : b;
+      let cut = pending.length - (BODY_CLOSE.length - 1);
+      const i = lastBodyClose(pending);
+      if (i >= 0 && pending.length - i <= HOLD_MAX) cut = i;
+      if (cut <= 0) { later(cb); return true; }
+      const out = pending.subarray(0, cut);
+      pending = Buffer.from(pending.subarray(cut));
+      return cb ? origWrite.call(this, out, cb) : origWrite.call(this, out);
+    }
+    if (mode === 'buffer') {
+      size += b.length;
+      if (size <= BUFFER_MAX) { chunks.push(b); later(cb); return true; }
+      // Too large to read whole: what was held goes out first, in order.
+      mode = 'pass';
+      if (chunks.length) origWrite.call(this, Buffer.concat(chunks));
+      chunks = [];
+      return cb ? origWrite.call(this, b, cb) : origWrite.call(this, b);
+    }
+    return cb ? origWrite.call(this, chunk, ...args, cb) : origWrite.call(this, chunk, ...args);
+  };
+  res.end = function (chunk, ...args) {
+    res.write = origWrite;
+    res.end = origEnd;
+    if (typeof chunk === 'function') { args = [chunk]; chunk = null; }
+    const cb = typeof args[args.length - 1] === 'function' ? args[args.length - 1] : null;
+    const b = chunk != null ? toBuffer(chunk) : null;
+    // Nothing written before end: the one chunk is read whole, so its
+    // length is known.
+    if (!mode) mode = whole || (isHTML() && tag) ? 'buffer' : 'pass';
+    if (mode === 'stream') {
+      const rest = withTag(b ? Buffer.concat([pending, b]) : pending, tag);
+      finish(null, html);
+      return cb ? origEnd.call(this, rest, cb) : origEnd.call(this, rest);
+    }
+    if (mode === 'buffer' && b && size + b.length > BUFFER_MAX) {
+      // Too large to read whole: out as it was, in order.
+      if (chunks.length) origWrite.call(this, Buffer.concat(chunks));
+      finish(null, isHTML());
+      return cb ? origEnd.call(this, b, cb) : origEnd.call(this, b);
+    }
+    if (mode === 'buffer') {
+      if (b) chunks.push(b);
+      html = isHTML();
+      const body = finish(Buffer.concat(chunks), html);
+      return cb ? origEnd.call(this, body, cb) : origEnd.call(this, body);
+    }
+    finish(null, html || isHTML());
+    return origEnd.call(this, chunk, ...args);
+  };
+}
+
 function addressBlock(addr) {
   if (!addr) return '';
   let ip = String(addr).trim().replace(/^\[|\]$/g, '');
@@ -646,3 +745,5 @@ function addressBlock(addr) {
 }
 
 module.exports = { createRanvia, LOADER_VERSION, addressBlock };
+// For the loader's own tests; not part of the API.
+Object.defineProperty(module.exports, '_tagResponse', { value: tagResponse });
