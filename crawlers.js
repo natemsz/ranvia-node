@@ -20,6 +20,7 @@ const SEARCH_CRAWLERS = [
   ['applebot', ['.applebot.apple.com']],
   ['duckduckbot', ['.duckduckgo.com']],
   ['yandexbot', ['.yandex.ru', '.yandex.net', '.yandex.com']],
+  ['baiduspider', ['.baidu.com', '.baidu.jp']],
 ];
 
 const CACHE_MAX = 4096;

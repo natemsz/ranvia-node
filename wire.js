@@ -49,6 +49,9 @@ function decodeDecision(buf) {
   d.body = Buffer.from(str());
   // Engines from before the reason field end here.
   d.reason = o < buf.length ? str().toString('utf8') : '';
+  // Engines before 0.4.1 end here: the tag a served page or robots.txt
+  // carries (prove) comes last.
+  d.prove = o < buf.length ? str().toString('utf8') : '';
   return d;
 }
 
