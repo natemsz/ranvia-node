@@ -63,3 +63,57 @@ test('a page read whole is handed to finish; one too large goes out in order', a
   assert.strictEqual(text.length, 2 * big.length + 3);
   assert.ok(text.startsWith('A') && text[big.length + 1] === 'B' && text.endsWith('C'), 'out of order');
 });
+
+test('flushHeaders does not send a whole-read body with its old length', async () => {
+  const srv = http.createServer((req, res) => {
+    tagResponse(res, {
+      tag: '',
+      whole: true,
+      finish(body) {
+        const out = Buffer.concat([body, Buffer.from('-more')]);
+        res.setHeader('content-length', String(out.length));
+        return out;
+      },
+    });
+    res.writeHead(200, { 'Content-Type': 'application/xml', 'Content-Length': 4 });
+    res.flushHeaders();
+    res.end('<x/>');
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  try {
+    const r = await fetch('http://127.0.0.1:' + srv.address().port + '/');
+    assert.strictEqual(await r.text(), '<x/>-more');
+    assert.strictEqual(r.headers.get('content-length'), '9');
+  } finally {
+    srv.closeAllConnections();
+    srv.close();
+  }
+});
+
+test('a body read whole keeps its new length after the handler calls writeHead', async () => {
+  const srv = http.createServer((req, res) => {
+    tagResponse(res, {
+      tag: '',
+      whole: true,
+      finish(body) {
+        const out = Buffer.concat([body, Buffer.from('-and-more')]);
+        res.setHeader('content-length', String(out.length));
+        return out;
+      },
+    });
+    const buf = Buffer.from('<urlset></urlset>');
+    res.writeHead(200, { 'Content-Type': 'application/xml', 'Content-Length': buf.length, 'X-Kept': 'yes' });
+    res.end(buf);
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  try {
+    const r = await fetch('http://127.0.0.1:' + srv.address().port + '/');
+    assert.strictEqual(await r.text(), '<urlset></urlset>-and-more');
+    assert.strictEqual(r.headers.get('content-length'), '26');
+    assert.strictEqual(r.headers.get('x-kept'), 'yes');
+    assert.strictEqual(r.headers.get('content-type'), 'application/xml');
+  } finally {
+    srv.closeAllConnections();
+    srv.close();
+  }
+});

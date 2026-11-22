@@ -27,7 +27,7 @@ const { encodeRequest, decodeDecision } = require('./wire');
 const { createCrawlerVerifier, remoteIp } = require('./crawlers');
 
 const DEFAULT_SERVICE_URL = 'https://ranvia.io';
-const LOADER_VERSION = '0.4.2';
+const LOADER_VERSION = '0.4.3';
 const RULES_EVERY = 5 * 60e3;
 const USAGE_EVERY = 60e3;
 const ENGINE_EVERY = 5 * 60e3; // a conditional fetch: "not modified" unless a new engine is out
@@ -55,6 +55,12 @@ class Engine {
     // Engines from 0.3.0 confirm assets on the response: say this
     // loader will (see the writeHead hook in handle).
     if (instance.exports.ranvia_confirm) config = { ...config, confirm_assets: true };
+    // Engines from 0.5.0 may ask for a response to be rewritten: say
+    // this loader can (rewrite below).
+    if (instance.exports.ranvia_rewrite) config = { ...config, rewrite_responses: true };
+    // Engines from 0.6.0 may ask for their own answer to be held back
+    // (ranvia-hold); this loader honours it and removes the header.
+    config = { ...config, hold_responses: true };
     const err = JSON.parse(e.call('ranvia_init', Buffer.from(JSON.stringify(config))).toString() || '{}').error;
     if (err) throw new Error('ranvia: ' + err);
     return e;
@@ -100,6 +106,13 @@ class Engine {
   markdown(page) {
     if (!this.x.ranvia_markdown || !page.length) return Buffer.alloc(0);
     return this.call('ranvia_markdown', page);
+  }
+
+  // rewrite returns a response body as the engine rewrites it (engines
+  // from 0.5.0); empty when it cannot.
+  rewrite(body) {
+    if (!this.x.ranvia_rewrite || !body.length) return Buffer.alloc(0);
+    return this.call('ranvia_rewrite', body);
   }
 
   robots(body) {
@@ -437,13 +450,33 @@ function createRanvia(cfg = {}) {
       return true;
     }
     let markdown = false;
+    let rewrite = false;
+    let hold = 0;
     for (const [k, v] of d.header) {
       if (k.toLowerCase() === 'ranvia-markdown') { markdown = true; continue; }
+      if (k.toLowerCase() === 'ranvia-rewrite') { rewrite = true; continue; }
+      if (k.toLowerCase() === 'ranvia-hold') { hold = parseInt(v, 10) || 0; continue; }
       res.appendHeader(k, v);
     }
     if (!d.serve) {
       if (cfg.logRefusals && d.reason) {
         log(`ranvia: ${d.reason} ${req.method} ${(req.originalUrl || req.url || '').split('?')[0]} ${JSON.stringify(req.headers['user-agent'] || '')}`);
+      }
+      // The engine asked for its answer to wait (ranvia-hold, in ms);
+      // a client that goes away ends the wait.
+      // A held answer costs a timer and an idle connection; past 256 at
+      // once, answers go out unheld.
+      if (hold > 0 && holding < 256) {
+        holding++;
+        try {
+          await new Promise((resolve) => {
+            const t = setTimeout(resolve, Math.min(hold, 15000));
+            res.once('close', () => { clearTimeout(t); resolve(); });
+          });
+        } finally {
+          holding--;
+        }
+        if (res.destroyed || res.writableEnded) return false;
       }
       res.statusCode = d.status || 200;
       res.end(d.body);
@@ -532,6 +565,34 @@ function createRanvia(cfg = {}) {
         }
         return origWriteHead.call(this, status, ...rest);
       };
+      return true;
+    }
+    // The engine asked to rewrite this response: buffer it whole and
+    // send what the engine returns.
+    if (rewrite && !d.confirm) {
+      tagResponse(res, {
+        tag: '',
+        whole: true,
+        finish(body) {
+          if (body && (!res.statusCode || res.statusCode === 200)) {
+            try {
+              const out = e.rewrite(body);
+              if (out.length) {
+                body = out;
+                try {
+                  res.setHeader('content-length', String(body.length));
+                  // This copy is for this client: a shared cache must
+                  // not hand it to a verified crawler.
+                  res.setHeader('cache-control', 'private, no-store');
+                  for (const h of ['etag', 'last-modified', 'expires', 'cdn-cache-control', 'cloudflare-cdn-cache-control', 'vercel-cdn-cache-control', 'surrogate-control']) res.removeHeader(h);
+                } catch { /* headers already sent */ }
+              }
+            } catch { /* engine replaced: the response goes out as it was */ }
+          }
+          try { if (d.sniff) e.served(d.sniff, false); } catch { /* engine replaced */ }
+          return body;
+        },
+      });
       return true;
     }
     const robots = (req.url || '').split('?')[0] === '/robots.txt';
@@ -663,6 +724,34 @@ function tagResponse(res, { tag, whole, finish }) {
     }
   };
   const later = (cb) => { if (cb) process.nextTick(cb); };
+  // A body read whole can change length, so a handler's writeHead only
+  // records its status and headers; they go out with the final body.
+  const origWriteHead = res.writeHead;
+  const unhook = () => { if (whole) res.writeHead = origWriteHead; };
+  if (whole) {
+    // Flushing would send those headers before the final body is known.
+    const origFlush = res.flushHeaders;
+    res.flushHeaders = function () { if (mode === 'pass') return origFlush.call(this); };
+    res.writeHead = function (status, ...rest) {
+      if (status < 200) return origWriteHead.call(this, status, ...rest);
+      unhook();
+      res.statusCode = status;
+      const seen = new Set();
+      const put = (k, v) => {
+        const name = String(k).toLowerCase();
+        if (seen.has(name)) res.appendHeader(k, v); else res.setHeader(k, v);
+        seen.add(name);
+      };
+      for (const a of rest) {
+        if (typeof a === 'string') res.statusMessage = a;
+        else if (Array.isArray(a)) {
+          if (Array.isArray(a[0])) for (const [k, v] of a) put(k, v);
+          else for (let i = 0; i + 1 < a.length; i += 2) put(a[i], a[i + 1]);
+        } else if (a) for (const k of Object.keys(a)) put(k, a[k]);
+      }
+      return this;
+    };
+  }
   res.write = function (chunk, ...args) {
     if (chunk == null || typeof chunk === 'function') return origWrite.call(this, chunk, ...args);
     decide();
@@ -683,6 +772,7 @@ function tagResponse(res, { tag, whole, finish }) {
       if (size <= BUFFER_MAX) { chunks.push(b); later(cb); return true; }
       // Too large to read whole: what was held goes out first, in order.
       mode = 'pass';
+      unhook();
       if (chunks.length) origWrite.call(this, Buffer.concat(chunks));
       chunks = [];
       return cb ? origWrite.call(this, b, cb) : origWrite.call(this, b);
@@ -692,6 +782,7 @@ function tagResponse(res, { tag, whole, finish }) {
   res.end = function (chunk, ...args) {
     res.write = origWrite;
     res.end = origEnd;
+    unhook();
     if (typeof chunk === 'function') { args = [chunk]; chunk = null; }
     const cb = typeof args[args.length - 1] === 'function' ? args[args.length - 1] : null;
     const b = chunk != null ? toBuffer(chunk) : null;
@@ -743,6 +834,9 @@ function addressBlock(addr) {
   while (first.length && first[first.length - 1] === '0') first.pop();
   return first.join(':') + '::/48';
 }
+
+// Engine answers being held back right now (ranvia-hold).
+let holding = 0;
 
 module.exports = { createRanvia, LOADER_VERSION, addressBlock };
 // For the loader's own tests; not part of the API.
