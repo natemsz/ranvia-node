@@ -1,6 +1,6 @@
 {
   "name": "ranvia",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "description": "Bot and AI scraper protection that runs on your own server: middleware for Express, Connect and node:http.",
   "keywords": [
     "bot",

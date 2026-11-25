@@ -27,7 +27,7 @@ const { encodeRequest, decodeDecision } = require('./wire');
 const { createCrawlerVerifier, remoteIp } = require('./crawlers');
 
 const DEFAULT_SERVICE_URL = 'https://ranvia.io';
-const LOADER_VERSION = '0.4.3';
+const LOADER_VERSION = '0.4.4';
 const RULES_EVERY = 5 * 60e3;
 const USAGE_EVERY = 60e3;
 const ENGINE_EVERY = 5 * 60e3; // a conditional fetch: "not modified" unless a new engine is out
@@ -171,6 +171,7 @@ function createRanvia(cfg = {}) {
   let running = null; // the sealed copy the engine was started from
   let restarting = null;
   let bundle = null;
+  let lastRobots = null;
   let closed = false;
   const timers = [];
 
@@ -294,6 +295,9 @@ function createRanvia(cfg = {}) {
     const e = await Engine.start(open(sealed), { key: cfg.key, rules, service_keys: cfg.serviceKeys }, log);
     if (bundle) {
       try { e.bundle(bundle); } catch { /* the next refresh brings a fresh one */ }
+    }
+    if (lastRobots) {
+      try { e.robots(lastRobots); } catch { /* next robots.txt fetch refreshes it */ }
     }
     return e;
   }
@@ -630,7 +634,12 @@ function createRanvia(cfg = {}) {
                 }
               } catch { /* engine replaced: the page goes out as it was */ }
             }
-            try { if (robots && ok) e.robots(body); } catch { /* engine replaced */ }
+            try {
+              if (robots && ok) {
+                lastRobots = body;
+                e.robots(body);
+              }
+            } catch { /* engine replaced */ }
           }
           try { if (d.sniff) e.served(d.sniff, html); } catch { /* engine replaced */ }
           return body;
