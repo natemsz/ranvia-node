@@ -6,15 +6,6 @@
 //   const ranvia = createRanvia({ key: process.env.RANVIA_KEY });
 //   app.use(ranvia.middleware);                       // Express, Connect
 //   http.createServer(ranvia.wrap(handler));          // plain node:http
-//
-// This package is a loader. The engine that decides is downloaded from
-// ranvia.io for your site key, kept on disk encrypted for your site, and
-// run in memory as WebAssembly. Your traffic never leaves your server:
-// the service only sends rules and receives counts.
-//
-// Until the engine is running (first start with ranvia.io out of reach,
-// a revoked key), every request passes and the reason is logged: Ranvia
-// never takes your site down.
 
 const crypto = require('node:crypto');
 const fs = require('node:fs/promises');
@@ -27,10 +18,15 @@ const { encodeRequest, decodeDecision } = require('./wire');
 const { createCrawlerVerifier, remoteIp } = require('./crawlers');
 
 const DEFAULT_SERVICE_URL = 'https://ranvia.io';
-const LOADER_VERSION = '0.4.4';
+const LOADER_VERSION = '0.5.0';
 const RULES_EVERY = 5 * 60e3;
 const USAGE_EVERY = 60e3;
-const ENGINE_EVERY = 5 * 60e3; // a conditional fetch: "not modified" unless a new engine is out
+const ENGINE_EVERY = 5 * 60e3;
+const HARD_TIMEOUT = 2500;
+
+function isTerminalAuthStatus(status) {
+  return status === 401 || status === 402 || status === 403;
+}
 
 function parseSiteKey(key) {
   const m = /^rnv_([a-z0-9]+)\.([A-Za-z0-9_-]+)$/.exec(String(key || '').trim());
@@ -41,7 +37,6 @@ function parseSiteKey(key) {
 
 const jitter = (ms) => ms * (0.8 + Math.random() * 0.4);
 
-// Engine is one running copy of the WebAssembly engine.
 class Engine {
   static async start(wasm, config, log) {
     let memory;
@@ -52,26 +47,31 @@ class Engine {
     memory = instance.exports.memory;
     instance.exports._initialize();
     const e = new Engine(instance.exports);
-    // Engines from 0.3.0 confirm assets on the response: say this
-    // loader will (see the writeHead hook in handle).
     if (instance.exports.ranvia_confirm) config = { ...config, confirm_assets: true };
-    // Engines from 0.5.0 may ask for a response to be rewritten: say
-    // this loader can (rewrite below).
     if (instance.exports.ranvia_rewrite) config = { ...config, rewrite_responses: true };
-    // Engines from 0.6.0 may ask for their own answer to be held back
-    // (ranvia-hold); this loader honours it and removes the header.
+    if (instance.exports.ranvia_hard_verdict && instance.exports.ranvia_hard_fallback) {
+      config = { ...config, remote_hard: true };
+    }
     config = { ...config, hold_responses: true };
-    const err = JSON.parse(e.call('ranvia_init', Buffer.from(JSON.stringify(config))).toString() || '{}').error;
+    const cfgBuf = Buffer.from(JSON.stringify(config));
+    let err;
+    try {
+      err = JSON.parse(e.call('ranvia_init', cfgBuf).toString() || '{}').error;
+    } finally {
+      cfgBuf.fill(0);
+    }
     if (err) throw new Error('ranvia: ' + err);
+    if (instance.exports.ranvia_box) {
+      e.boxToken = e.call('ranvia_box').toString('utf8');
+    }
     return e;
   }
 
   constructor(exports) {
     this.x = exports;
+    this.boxToken = '';
   }
 
-  // call runs an export with input copied into the engine's memory and
-  // returns its output, copied out.
   call(name, input, ...extra) {
     const x = this.x;
     let args = extra;
@@ -100,16 +100,11 @@ class Engine {
     this.x.ranvia_served(id, html ? 1 : 0);
   }
 
-  // robots hands the engine the robots.txt that just went out (engines
-  // from 0.4.0 read it for robots.txt violations).
-  // markdown converts a page with the engine (engines from 0.4.0).
   markdown(page) {
     if (!this.x.ranvia_markdown || !page.length) return Buffer.alloc(0);
     return this.call('ranvia_markdown', page);
   }
 
-  // rewrite returns a response body as the engine rewrites it (engines
-  // from 0.5.0); empty when it cannot.
   rewrite(body) {
     if (!this.x.ranvia_rewrite || !body.length) return Buffer.alloc(0);
     return this.call('ranvia_rewrite', body);
@@ -119,8 +114,6 @@ class Engine {
     if (this.x.ranvia_robots && body.length) this.call('ranvia_robots', body);
   }
 
-  // confirm answers a Confirm decision with the response's status and
-  // Content-Type; it returns the Set-Cookie value to add, '' for none.
   confirm(id, status, contentType) {
     const x = this.x;
     if (!x.ranvia_confirm) return '';
@@ -139,6 +132,33 @@ class Engine {
   bundle(raw) {
     const err = JSON.parse(this.call('ranvia_bundle', raw).toString() || '{}').error;
     if (err) throw new Error('ranvia: ' + err);
+  }
+
+  posture() {
+    if (!this.x.ranvia_posture) return Buffer.alloc(0);
+    return this.call('ranvia_posture');
+  }
+
+  applyPosture(raw) {
+    if (!this.x.ranvia_posture_apply || !raw.length) return;
+    const err = JSON.parse(this.call('ranvia_posture_apply', raw).toString() || '{}').error;
+    if (err) throw new Error('ranvia: ' + err);
+  }
+
+  hardVerdict(raw) {
+    if (!this.x.ranvia_hard_verdict || !raw.length) return [];
+    const out = this.call('ranvia_hard_verdict', raw);
+    if (!out.length) return [];
+    try {
+      return JSON.parse(out.toString('utf8')).cookies || [];
+    } catch {
+      return [];
+    }
+  }
+
+  hardFallback(ctxTok) {
+    if (!this.x.ranvia_hard_fallback) return { serve: true, header: [] };
+    return decodeDecision(this.call('ranvia_hard_fallback', Buffer.from(ctxTok)));
   }
 
   rulesVersion() {
@@ -168,14 +188,13 @@ function createRanvia(cfg = {}) {
     path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'), 'ranvia');
   const cacheFile = path.join(cacheDir, 'engine-' + key.id + '.bin');
   let engine = null;
-  let running = null; // the sealed copy the engine was started from
+  let running = null;
   let restarting = null;
   let bundle = null;
   let lastRobots = null;
   let closed = false;
   const timers = [];
 
-  // sign sets the Ranvia request headers (PROTOCOL.md).
   function signedHeaders(method, urlPath, body) {
     const ts = String(Math.floor(Date.now() / 1000));
     const nonce = crypto.randomBytes(16).toString('hex');
@@ -188,23 +207,30 @@ function createRanvia(cfg = {}) {
     };
   }
 
-  async function service(method, urlPath, body, etag) {
+  async function service(method, urlPath, body, etag, extra = null, timeoutMs = 0) {
     const headers = signedHeaders(method, urlPath, body);
     if (body) headers['Content-Type'] = 'application/json';
     if (etag) headers['If-None-Match'] = etag;
-    // The engine is megabytes: compressed before sealing, and given
-    // minutes on a slow link where a rules check gets 30 seconds.
-    const engine = urlPath === '/v1/engine';
-    if (engine) headers['Ranvia-Engine-Encoding'] = 'gzip';
-    const res = await fetch(base + urlPath, { method, headers, body, signal: AbortSignal.timeout(engine ? 600e3 : 30e3) });
+    const isEng = urlPath === '/v1/engine';
+    if (isEng) headers['Ranvia-Engine-Encoding'] = 'gzip';
+    if (extra) {
+      for (const [k, v] of Object.entries(extra)) {
+        if (v) headers[k] = v;
+      }
+    }
+    const ms = timeoutMs || (isEng ? 600e3 : 30e3);
+    const res = await fetch(base + urlPath, { method, headers, body, signal: AbortSignal.timeout(ms) });
     return { status: res.status, body: Buffer.from(await res.arrayBuffer()), etag: res.headers.get('etag') || '', headers: res.headers };
   }
 
-  // open unseals the site's engine copy, in memory only.
   function open(sealed) {
     const sealKey = crypto.createHmac('sha256', key.secret).update('ranvia engine key').digest();
-    if (sealed.length < 12 + 16) throw new Error('ranvia: the engine copy is truncated');
+    if (sealed.length < 12 + 16) {
+      sealKey.fill(0);
+      throw new Error('ranvia: the engine copy is truncated');
+    }
     const d = crypto.createDecipheriv('aes-256-gcm', sealKey, sealed.subarray(0, 12));
+    sealKey.fill(0);
     d.setAAD(Buffer.from(key.id));
     d.setAuthTag(sealed.subarray(sealed.length - 16));
     let plain;
@@ -213,15 +239,32 @@ function createRanvia(cfg = {}) {
     } catch {
       throw new Error('ranvia: the engine copy does not open with this site key');
     }
-    // Sent gzipped (WebAssembly itself starts "\0asm", gzip 1f 8b).
-    if (plain[0] === 0x1f && plain[1] === 0x8b) return zlib.gunzipSync(plain, { maxOutputLength: 256 << 20 });
+    if (plain[0] === 0x1f && plain[1] === 0x8b) {
+      try {
+        return zlib.gunzipSync(plain, { maxOutputLength: 256 << 20 });
+      } finally {
+        plain.fill(0);
+      }
+    }
     return plain;
+  }
+
+  async function wipeCache() {
+    await fs.unlink(cacheFile).catch(() => {});
+    await fs.unlink(cacheFile + '.etag').catch(() => {});
+  }
+
+  async function deactivate(status, detail) {
+    engine = null;
+    if (running) { running.fill(0); running = null; }
+    bundle = null;
+    await wipeCache();
+    log(`ranvia: service answered ${status}${detail ? ' (' + detail + ')' : ''}; engine unloaded and passing requests through`);
   }
 
   async function readCache() {
     try {
       const sealed = await fs.readFile(cacheFile);
-      // The ETag, then (from 0.3.0) the copy's issue time.
       const [etag = '', issued = '0'] = (await fs.readFile(cacheFile + '.etag', 'utf8').catch(() => '')).trim().split('\n');
       return { sealed, etag: etag.trim(), issued: Number(issued) || 0 };
     } catch {
@@ -240,8 +283,6 @@ function createRanvia(cfg = {}) {
     }
   }
 
-  // checkIssue checks a downloaded copy's issue tag
-  // (Ranvia-Engine-Tag) and returns its issue time, null if invalid.
   function checkIssue(headers, sealed) {
     const issued = headers && headers.get('ranvia-engine-issued');
     const tag = headers && headers.get('ranvia-engine-tag');
@@ -249,14 +290,13 @@ function createRanvia(cfg = {}) {
     const sealKey = crypto.createHmac('sha256', key.secret).update('ranvia engine key').digest();
     const sum = crypto.createHash('sha256').update(sealed).digest('hex');
     const want = crypto.createHmac('sha256', sealKey).update('ranvia engine tag|' + key.id + '|' + issued + '|' + sum).digest('hex');
+    sealKey.fill(0);
     const a = Buffer.from(want, 'utf8');
     const b = Buffer.from(String(tag), 'utf8');
     if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
     return Number(issued);
   }
 
-  // fetchEngine returns the sealed engine: the service's copy when it
-  // answers, else the cache.
   async function fetchEngine() {
     const cached = await readCache();
     let res;
@@ -269,12 +309,17 @@ function createRanvia(cfg = {}) {
       }
       throw new Error('ranvia: engine download: ' + err.message);
     }
+    if (isTerminalAuthStatus(res.status)) {
+      if (cached.sealed) cached.sealed.fill(0);
+      await deactivate(res.status, res.body.toString('utf8').trim());
+      const inactive = new Error('ranvia: site key or plan is inactive');
+      inactive.inactive = true;
+      throw inactive;
+    }
     if (res.status === 200) {
-      // Only a copy the service tagged, issued no earlier than the one
-      // cached: a replayed old copy (an engine with since-fixed gaps)
-      // is refused.
       const issued = checkIssue(res.headers, res.body);
       if (issued !== null && issued >= cached.issued) {
+        if (cached.sealed) cached.sealed.fill(0);
         await writeCache(res.body, res.etag, issued);
         return { sealed: res.body, changed: true };
       }
@@ -289,12 +334,18 @@ function createRanvia(cfg = {}) {
     throw new Error('ranvia: engine download: service answered ' + res.status + ': ' + res.body.toString().trim());
   }
 
-  async function load(sealed) {
+  async function load(sealed, withBundle = bundle) {
     let rules;
     if (cfg.rulesFile) rules = JSON.parse(await fs.readFile(cfg.rulesFile, 'utf8'));
-    const e = await Engine.start(open(sealed), { key: cfg.key, rules, service_keys: cfg.serviceKeys }, log);
-    if (bundle) {
-      try { e.bundle(bundle); } catch { /* the next refresh brings a fresh one */ }
+    const wasm = open(sealed);
+    let e;
+    try {
+      e = await Engine.start(wasm, { key: cfg.key, rules, service_keys: cfg.serviceKeys }, log);
+    } finally {
+      wasm.fill(0);
+    }
+    if (withBundle) {
+      try { e.bundle(withBundle); } catch { /* next refresh brings a box-sealed bundle */ }
     }
     if (lastRobots) {
       try { e.robots(lastRobots); } catch { /* next robots.txt fetch refreshes it */ }
@@ -302,15 +353,63 @@ function createRanvia(cfg = {}) {
     return e;
   }
 
-  async function refreshRules() {
-    if (!engine) return;
-    const e = engine;
-    const v = e.rulesVersion();
-    const res = await service('GET', '/v1/rules', null, v ? '"' + v + '"' : '');
+  async function refreshRules(target = engine) {
+    if (!target) return;
+    const v = target.rulesVersion();
+    const extra = target.boxToken ? { 'Ranvia-Box': target.boxToken } : null;
+    const res = await service('GET', '/v1/rules', null, v ? '"' + v + '"' : '', extra);
+    if (isTerminalAuthStatus(res.status)) {
+      await deactivate(res.status, res.body.toString('utf8').trim());
+      return;
+    }
     if (res.status === 304) return;
     if (res.status !== 200) throw new Error('ranvia: rules: service answered ' + res.status);
-    e.bundle(res.body);
+    target.bundle(res.body);
     bundle = res.body;
+  }
+
+  async function syncPosture(target = engine) {
+    if (!target) return;
+    const req = target.posture();
+    if (!req.length) return;
+    const extra = target.boxToken ? { 'Ranvia-Box': target.boxToken } : null;
+    const res = await service('POST', '/v1/posture', req, '', extra);
+    if (res.status === 200 && res.body.length) target.applyPosture(res.body);
+  }
+
+  async function proxyHard(res, target, hardCtx, payload) {
+    const extra = { 'Ranvia-Hard-Ctx': hardCtx };
+    if (target.boxToken) extra['Ranvia-Box'] = target.boxToken;
+    let upstream;
+    try {
+      upstream = await service('POST', '/v1/hard', payload, '', extra, HARD_TIMEOUT);
+    } catch {
+      upstream = null;
+    }
+    if (!upstream || upstream.status >= 500) {
+      const fb = target.hardFallback(hardCtx);
+      if (fb.serve) {
+        res.statusCode = 503;
+        res.end();
+        return;
+      }
+      for (const [k, v] of fb.header || []) res.appendHeader(k, v);
+      res.statusCode = fb.status || 429;
+      res.end(fb.body);
+      return;
+    }
+    const verdict = upstream.headers.get('ranvia-hard-verdict');
+    if (verdict) {
+      for (const ck of target.hardVerdict(Buffer.from(verdict, 'utf8'))) {
+        res.appendHeader('Set-Cookie', ck);
+      }
+    }
+    const ct = upstream.headers.get('content-type');
+    if (ct) res.setHeader('Content-Type', ct);
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.statusCode = upstream.status;
+    res.end(upstream.body);
   }
 
   async function reportUsage(e = engine) {
@@ -328,7 +427,7 @@ function createRanvia(cfg = {}) {
   function every(ms, fn) {
     const run = async () => {
       if (closed) return;
-      try { await fn(); } catch (err) { log(err.message); }
+      try { await fn(); } catch (err) { if (!err.inactive) log(err.message); }
       if (!closed) timers.push(setTimeout(run, jitter(ms)).unref());
     };
     timers.push(setTimeout(run, jitter(ms)).unref());
@@ -339,23 +438,29 @@ function createRanvia(cfg = {}) {
     while (!closed && !engine) {
       try {
         const { sealed } = await fetchEngine();
-        engine = await load(sealed);
+        engine = await load(sealed, null);
         running = sealed;
         log('ranvia: engine running');
       } catch (err) {
-        log(err.message + '; passing requests until the engine loads');
+        if (!err.inactive) log(err.message + '; passing requests until the engine loads');
         await new Promise((r) => setTimeout(r, jitter(wait)).unref());
         wait = Math.min(wait * 2, 5 * 60e3);
       }
     }
     if (closed) return;
-    try { await refreshRules(); } catch (err) { log(err.message); }
-    every(RULES_EVERY, refreshRules);
-    every(USAGE_EVERY, async () => { if (!engine) return; engine.tick(); await reportUsage(); });
+    try { await refreshRules(); } catch (err) { if (!err.inactive) log(err.message); }
+    every(RULES_EVERY, () => refreshRules());
+    every(USAGE_EVERY, async () => {
+      if (!engine) return;
+      engine.tick();
+      await syncPosture();
+      await reportUsage();
+    });
     every(ENGINE_EVERY, async () => {
       const { sealed, changed } = await fetchEngine();
-      if (!changed && (engine || restarting)) return; // unchanged, or a failed restart to retry
-      const next = await load(sealed);
+      if (!changed && (engine || restarting)) return;
+      const next = await load(sealed, null);
+      try { await refreshRules(next); } catch { /* uses defaults until next rules tick */ }
       const old = engine;
       engine = next;
       running = sealed;
@@ -364,9 +469,6 @@ function createRanvia(cfg = {}) {
     });
   })();
 
-  // readBody reads the check's answer (at most 1 KiB). A body parser
-  // that ran first has it already; a body already read, or one that
-  // never finishes, is no answer rather than a request left hanging.
   function readBody(req) {
     if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) {
       return Promise.resolve(new URLSearchParams(req.body).toString().slice(0, 1024));
@@ -387,14 +489,14 @@ function createRanvia(cfg = {}) {
     });
   }
 
-  // restart replaces an engine that failed a call (a trapped module
-  // stays broken) with a fresh copy of the same one.
   function restart(broken) {
     if (engine !== broken || restarting || !running) return;
     engine = null;
     restarting = (async () => {
       try {
-        engine = await load(running);
+        const next = await load(running, null);
+        try { await refreshRules(next); } catch { /* refreshed on next rules tick */ }
+        engine = next;
         log('ranvia: engine restarted');
       } catch (err) {
         log(err.message + '; passing requests until the engine loads');
@@ -404,13 +506,9 @@ function createRanvia(cfg = {}) {
     })();
   }
 
-  // handle decides one request: true when the site should serve it.
   async function handle(req, res) {
     const e = engine;
     if (!e) return true;
-    // Forwarded headers are trusted only from a loopback peer (the
-    // local proxy in front), as in the Go loader; a direct client
-    // must not assert its own scheme or address.
     let header = req.headers;
     const peer = String((req.socket && req.socket.remoteAddress) || '').replace(/^::ffff:/, '');
     if (!(peer === '::1' || peer.startsWith('127.'))) {
@@ -418,15 +516,12 @@ function createRanvia(cfg = {}) {
       delete header['x-forwarded-proto'];
       delete header['x-forwarded-for'];
     }
-    // The JA4 the engine reads comes from a trusted edge, never from
-    // the client.
     if (header['ranvia-ja4'] !== undefined || cfg.ja4Header) {
       if (header === req.headers) header = { ...req.headers };
       delete header['ranvia-ja4'];
       const ja4 = cfg.ja4Header ? req.headers[String(cfg.ja4Header).toLowerCase()] : undefined;
       if (typeof ja4 === 'string' && ja4.length <= 64) header['ranvia-ja4'] = ja4;
     }
-    // Likewise the HTTP/2 fingerprint.
     if (header['ranvia-h2'] !== undefined || cfg.h2Header) {
       if (header === req.headers) header = { ...req.headers };
       delete header['ranvia-h2'];
@@ -456,20 +551,23 @@ function createRanvia(cfg = {}) {
     let markdown = false;
     let rewrite = false;
     let hold = 0;
+    let hardCtx = '';
     for (const [k, v] of d.header) {
-      if (k.toLowerCase() === 'ranvia-markdown') { markdown = true; continue; }
-      if (k.toLowerCase() === 'ranvia-rewrite') { rewrite = true; continue; }
-      if (k.toLowerCase() === 'ranvia-hold') { hold = parseInt(v, 10) || 0; continue; }
+      const lk = k.toLowerCase();
+      if (lk === 'ranvia-markdown') { markdown = true; continue; }
+      if (lk === 'ranvia-rewrite') { rewrite = true; continue; }
+      if (lk === 'ranvia-hold') { hold = parseInt(v, 10) || 0; continue; }
+      if (lk === 'ranvia-hard') { hardCtx = v; continue; }
       res.appendHeader(k, v);
+    }
+    if (!d.serve && hardCtx) {
+      await proxyHard(res, e, hardCtx, d.body);
+      return false;
     }
     if (!d.serve) {
       if (cfg.logRefusals && d.reason) {
         log(`ranvia: ${d.reason} ${req.method} ${(req.originalUrl || req.url || '').split('?')[0]} ${JSON.stringify(req.headers['user-agent'] || '')}`);
       }
-      // The engine asked for its answer to wait (ranvia-hold, in ms);
-      // a client that goes away ends the wait.
-      // A held answer costs a timer and an idle connection; past 256 at
-      // once, answers go out unheld.
       if (hold > 0 && holding < 256) {
         holding++;
         try {
@@ -487,8 +585,6 @@ function createRanvia(cfg = {}) {
       return false;
     }
     if (d.sniff && d.confirm) {
-      // Just before the headers go out (an explicit writeHead, or the
-      // implicit one Node runs on the first write or end).
       const origWriteHead = res.writeHead;
       const origWrite = res.write;
       const origEnd = res.end;
@@ -571,8 +667,6 @@ function createRanvia(cfg = {}) {
       };
       return true;
     }
-    // The engine asked to rewrite this response: buffer it whole and
-    // send what the engine returns.
     if (rewrite && !d.confirm) {
       tagResponse(res, {
         tag: '',
@@ -585,13 +679,11 @@ function createRanvia(cfg = {}) {
                 body = out;
                 try {
                   res.setHeader('content-length', String(body.length));
-                  // This copy is for this client: a shared cache must
-                  // not hand it to a verified crawler.
                   res.setHeader('cache-control', 'private, no-store');
                   for (const h of ['etag', 'last-modified', 'expires', 'cdn-cache-control', 'cloudflare-cdn-cache-control', 'vercel-cdn-cache-control', 'surrogate-control']) res.removeHeader(h);
                 } catch { /* headers already sent */ }
               }
-            } catch { /* engine replaced: the response goes out as it was */ }
+            } catch { /* engine replaced */ }
           }
           try { if (d.sniff) e.served(d.sniff, false); } catch { /* engine replaced */ }
           return body;
@@ -601,10 +693,6 @@ function createRanvia(cfg = {}) {
     }
     const robots = (req.url || '').split('?')[0] === '/robots.txt';
     if (d.prove || robots || (markdown && !d.confirm)) {
-      // The engine's tag goes before </body>: an HTML page streams as
-      // the handler writes it (tagResponse). robots.txt and a page
-      // going out as Markdown are buffered whole: the engine may add
-      // lines to robots.txt, and reads what went out.
       const tag = d.prove || '';
       tagResponse(res, {
         tag,
@@ -632,7 +720,7 @@ function createRanvia(cfg = {}) {
                   res.setHeader('content-length', String(body.length));
                   res.appendHeader('vary', 'Accept');
                 }
-              } catch { /* engine replaced: the page goes out as it was */ }
+              } catch { /* engine replaced */ }
             }
             try {
               if (robots && ok) {
@@ -657,20 +745,16 @@ function createRanvia(cfg = {}) {
   }
 
   return {
-    // middleware is Express / Connect middleware.
     middleware(req, res, next) {
       handle(req, res).then((serve) => { if (serve) next(); }, (err) => { log(err.message); next(); });
     },
-    // wrap guards a plain node:http request handler.
     wrap(handler) {
       return (req, res) => {
         handle(req, res).then((serve) => { if (serve) handler(req, res); }, (err) => { log(err.message); handler(req, res); });
       };
     },
-    // ready resolves once the engine is running (or close is called).
     ready: () => started,
     isReady: () => engine !== null,
-    // close stops background work, sending a last usage report.
     async close() {
       closed = true;
       for (const t of timers) clearTimeout(t);
@@ -679,24 +763,11 @@ function createRanvia(cfg = {}) {
   };
 }
 
-// addressBlock is an address's /24 (IPv4) or /48 (IPv6), which the
-// engine ties passes to when the site names no network; '' for a
-// loopback, private or unreadable one. It stays on this server.
-// tagResponse wraps res so the engine's tag can go before a page's
-// last </body>. The first write decides: an HTML page with a tag
-// streams as written, holding back only the bytes from the last
-// "</body>" seen (or a few, in case one is split across writes), so a
-// streamed page arrives as it renders; with whole set (robots.txt, a
-// page going out as Markdown) the body is buffered up to 8 MiB and
-// handed to finish, whose return goes out; anything else passes
-// through. finish(body, html) is called once at the end, with a null
-// body when nothing was buffered.
 const BODY_CLOSE = '</body>';
 const BUFFER_MAX = 8 * 1024 * 1024;
 const HOLD_MAX = 64 * 1024;
 
 function lastBodyClose(b) {
-  // latin1 keeps one character per byte, so the index is a byte offset.
   return b.toString('latin1').toLowerCase().lastIndexOf(BODY_CLOSE);
 }
 
@@ -714,7 +785,7 @@ function toBuffer(c) {
 function tagResponse(res, { tag, whole, finish }) {
   const origWrite = res.write;
   const origEnd = res.end;
-  let mode = ''; // 'stream', 'buffer' or 'pass', set by the first write
+  let mode = '';
   let html = false;
   let pending = Buffer.alloc(0);
   let chunks = [];
@@ -733,12 +804,9 @@ function tagResponse(res, { tag, whole, finish }) {
     }
   };
   const later = (cb) => { if (cb) process.nextTick(cb); };
-  // A body read whole can change length, so a handler's writeHead only
-  // records its status and headers; they go out with the final body.
   const origWriteHead = res.writeHead;
   const unhook = () => { if (whole) res.writeHead = origWriteHead; };
   if (whole) {
-    // Flushing would send those headers before the final body is known.
     const origFlush = res.flushHeaders;
     res.flushHeaders = function () { if (mode === 'pass') return origFlush.call(this); };
     res.writeHead = function (status, ...rest) {
@@ -779,7 +847,6 @@ function tagResponse(res, { tag, whole, finish }) {
     if (mode === 'buffer') {
       size += b.length;
       if (size <= BUFFER_MAX) { chunks.push(b); later(cb); return true; }
-      // Too large to read whole: what was held goes out first, in order.
       mode = 'pass';
       unhook();
       if (chunks.length) origWrite.call(this, Buffer.concat(chunks));
@@ -795,8 +862,6 @@ function tagResponse(res, { tag, whole, finish }) {
     if (typeof chunk === 'function') { args = [chunk]; chunk = null; }
     const cb = typeof args[args.length - 1] === 'function' ? args[args.length - 1] : null;
     const b = chunk != null ? toBuffer(chunk) : null;
-    // Nothing written before end: the one chunk is read whole, so its
-    // length is known.
     if (!mode) mode = whole || (isHTML() && tag) ? 'buffer' : 'pass';
     if (mode === 'stream') {
       const rest = withTag(b ? Buffer.concat([pending, b]) : pending, tag);
@@ -804,7 +869,6 @@ function tagResponse(res, { tag, whole, finish }) {
       return cb ? origEnd.call(this, rest, cb) : origEnd.call(this, rest);
     }
     if (mode === 'buffer' && b && size + b.length > BUFFER_MAX) {
-      // Too large to read whole: out as it was, in order.
       if (chunks.length) origWrite.call(this, Buffer.concat(chunks));
       finish(null, isHTML());
       return cb ? origEnd.call(this, b, cb) : origEnd.call(this, b);
@@ -832,21 +896,17 @@ function addressBlock(addr) {
   if (!net.isIPv6(ip)) return '';
   const lower = ip.toLowerCase();
   if (lower === '::1' || lower === '::' || /^f[cd]/.test(lower) || /^fe[89ab]/.test(lower)) return '';
-  // Expand to eight groups, keep the first three.
   const [head, tail = ''] = lower.split('::');
   const h = head ? head.split(':') : [];
   const t = lower.includes('::') ? (tail ? tail.split(':') : []) : [];
   const groups = lower.includes('::') ? [...h, ...Array(8 - h.length - t.length).fill('0'), ...t] : h;
   if (groups.length !== 8) return '';
   const first = groups.slice(0, 3).map((g) => parseInt(g, 16).toString(16));
-  // Shortest form, as Go writes it: trailing zero groups fold into '::'.
   while (first.length && first[first.length - 1] === '0') first.pop();
   return first.join(':') + '::/48';
 }
 
-// Engine answers being held back right now (ranvia-hold).
 let holding = 0;
 
 module.exports = { createRanvia, LOADER_VERSION, addressBlock };
-// For the loader's own tests; not part of the API.
 Object.defineProperty(module.exports, '_tagResponse', { value: tagResponse });

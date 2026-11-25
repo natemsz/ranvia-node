@@ -150,3 +150,56 @@ test('writeHead merges es_assets with site Set-Cookie, handles array headers, 1x
 
   assert.ok(typeof execFileSync === 'function');
 });
+
+test('402 on /v1/rules unloads engine and wipes cached engine file', async (t) => {
+  const wasmPath = path.resolve(__dirname, '../../../dist/ranvia-core.wasm');
+  if (!fs.existsSync(wasmPath)) return;
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rnv-402-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const secretRaw = Buffer.alloc(32, 11);
+  const id = 's1';
+  const sealKey = crypto.createHmac('sha256', secretRaw).update('ranvia engine key').digest();
+  const wasm = fs.readFileSync(wasmPath);
+  const nonce = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', sealKey, nonce);
+  cipher.setAAD(Buffer.from(id));
+  const sealed = Buffer.concat([nonce, cipher.update(wasm), cipher.final(), cipher.getAuthTag()]);
+  const issued = '1700000000';
+  const sum = crypto.createHash('sha256').update(sealed).digest('hex');
+  const tag = crypto.createHmac('sha256', sealKey).update('ranvia engine tag|' + id + '|' + issued + '|' + sum).digest('hex');
+
+  let rulesCalls = 0;
+  const svc = http.createServer((req, res) => {
+    if (req.url === '/v1/engine') {
+      res.writeHead(200, { 'Ranvia-Engine-Issued': issued, 'Ranvia-Engine-Tag': tag, ETag: '"t1"' });
+      res.end(sealed);
+      return;
+    }
+    if (req.url === '/v1/rules') {
+      rulesCalls++;
+      res.writeHead(402, { 'Content-Type': 'text/plain' });
+      res.end('this account has reached its 2.5M trial request allowance');
+      return;
+    }
+    res.writeHead(204);
+    res.end();
+  });
+  await new Promise((r) => svc.listen(0, '127.0.0.1', r));
+  t.after(() => { svc.close(); svc.closeAllConnections(); });
+
+  const ranvia = createRanvia({
+    key: 'rnv_s1.' + secretRaw.toString('base64url'),
+    serviceUrl: 'http://127.0.0.1:' + svc.address().port,
+    cacheDir: dir,
+  });
+  t.after(() => ranvia.close());
+
+  const deadline = Date.now() + 15000;
+  while (rulesCalls === 0 && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 40));
+  }
+  await new Promise((r) => setTimeout(r, 80));
+  assert.strictEqual(ranvia.isReady(), false, 'engine must be unloaded after 402');
+  assert.strictEqual(fs.existsSync(path.join(dir, 'engine-s1.bin')), false, 'cached engine binary must be deleted after 402');
+});
