@@ -32,7 +32,11 @@ http.createServer(ranvia.wrap(handler));    // plain node:http
   and runs it in memory as WebAssembly.
 - **Ranvia never takes your site down.** If the engine can't run (first
   start with ranvia.io out of reach, a revoked key), every request
-  passes and the reason is logged.
+  passes and the reason is logged. From 0.6.0, the loader unloads the
+  engine and wipes its cached copy only on a signed shutdown from
+  ranvia.io; an unsigned 401, 402, or 403 (for example from a CDN or
+  proxy in between) is treated as temporary and leaves the running
+  engine in place. Loader 0.6.0 or later is required by ranvia.io.
 - **What visitors see:** scrapers are refused. Clients that behave like
   scrapers get a short browser check, which a real browser passes in
   about a second with no clicks.

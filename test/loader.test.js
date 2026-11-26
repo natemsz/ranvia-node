@@ -151,9 +151,10 @@ test('writeHead merges es_assets with site Set-Cookie, handles array headers, 1x
   assert.ok(typeof execFileSync === 'function');
 });
 
-test('402 on /v1/rules unloads engine and wipes cached engine file', async (t) => {
+// A 402 on /v1/rules, signed by the service for that request or not.
+async function lapsedPlan(t, signed) {
   const wasmPath = path.resolve(__dirname, '../../../dist/ranvia-core.wasm');
-  if (!fs.existsSync(wasmPath)) return;
+  if (!fs.existsSync(wasmPath)) return null;
 
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rnv-402-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -168,6 +169,7 @@ test('402 on /v1/rules unloads engine and wipes cached engine file', async (t) =
   const issued = '1700000000';
   const sum = crypto.createHash('sha256').update(sealed).digest('hex');
   const tag = crypto.createHmac('sha256', sealKey).update('ranvia engine tag|' + id + '|' + issued + '|' + sum).digest('hex');
+  const shutdownKey = crypto.createHmac('sha256', secretRaw).update('ranvia shutdown key').digest();
 
   let rulesCalls = 0;
   const svc = http.createServer((req, res) => {
@@ -178,7 +180,12 @@ test('402 on /v1/rules unloads engine and wipes cached engine file', async (t) =
     }
     if (req.url === '/v1/rules') {
       rulesCalls++;
-      res.writeHead(402, { 'Content-Type': 'text/plain' });
+      const h = { 'Content-Type': 'text/plain' };
+      if (signed) {
+        h['Ranvia-Shutdown'] = crypto.createHmac('sha256', shutdownKey)
+          .update('ranvia shutdown|' + id + '|402|' + req.headers['ranvia-nonce']).digest('hex');
+      }
+      res.writeHead(402, h);
       res.end('this account has reached its 2.5M trial request allowance');
       return;
     }
@@ -200,6 +207,19 @@ test('402 on /v1/rules unloads engine and wipes cached engine file', async (t) =
     await new Promise((r) => setTimeout(r, 40));
   }
   await new Promise((r) => setTimeout(r, 80));
-  assert.strictEqual(ranvia.isReady(), false, 'engine must be unloaded after 402');
-  assert.strictEqual(fs.existsSync(path.join(dir, 'engine-s1.bin')), false, 'cached engine binary must be deleted after 402');
+  return { ready: ranvia.isReady(), cached: fs.existsSync(path.join(dir, 'engine-s1.bin')) };
+}
+
+test('a 402 the service signed unloads the engine and wipes the cached engine file', async (t) => {
+  const out = await lapsedPlan(t, true);
+  if (!out) return;
+  assert.strictEqual(out.ready, false, 'engine must be unloaded after a signed 402');
+  assert.strictEqual(out.cached, false, 'cached engine binary must be deleted after a signed 402');
+});
+
+test('a 402 without the service signature leaves the engine running', async (t) => {
+  const out = await lapsedPlan(t, false);
+  if (!out) return;
+  assert.strictEqual(out.ready, true, 'engine must stay loaded after an unsigned 402');
+  assert.strictEqual(out.cached, true, 'cached engine binary must stay after an unsigned 402');
 });

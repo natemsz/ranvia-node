@@ -18,14 +18,23 @@ const { encodeRequest, decodeDecision } = require('./wire');
 const { createCrawlerVerifier, remoteIp } = require('./crawlers');
 
 const DEFAULT_SERVICE_URL = 'https://ranvia.io';
-const LOADER_VERSION = '0.5.0';
+const LOADER_VERSION = '0.6.0';
 const RULES_EVERY = 5 * 60e3;
 const USAGE_EVERY = 60e3;
+const IDLE_EVERY = 1e3;
 const ENGINE_EVERY = 5 * 60e3;
 const HARD_TIMEOUT = 2500;
 
 function isTerminalAuthStatus(status) {
   return status === 401 || status === 402 || status === 403;
+}
+
+// What the service signs a definite refusal with (Ranvia-Shutdown):
+// HMAC(HMAC(secret, "ranvia shutdown key"), "ranvia shutdown|<site>|<status>|<nonce>"),
+// the nonce being the request's own.
+function shutdownTag(secret, siteId, status, nonce) {
+  const k = crypto.createHmac('sha256', secret).update('ranvia shutdown key').digest();
+  return crypto.createHmac('sha256', k).update('ranvia shutdown|' + siteId + '|' + status + '|' + nonce).digest('hex');
 }
 
 function parseSiteKey(key) {
@@ -157,7 +166,14 @@ class Engine {
   }
 
   hardFallback(ctxTok) {
-    if (!this.x.ranvia_hard_fallback) return { serve: true, header: [] };
+    if (!this.x.ranvia_hard_fallback) {
+      return {
+        serve: false,
+        status: 503,
+        header: [['Content-Type', 'application/json'], ['Cache-Control', 'no-store'], ['Retry-After', '2']],
+        body: Buffer.from('{"wait":2000}'),
+      };
+    }
     return decodeDecision(this.call('ranvia_hard_fallback', Buffer.from(ctxTok)));
   }
 
@@ -167,6 +183,11 @@ class Engine {
 
   tick() {
     this.x.ranvia_tick();
+  }
+
+  // Background work between requests; engines without it skip.
+  idle() {
+    if (this.x.ranvia_idle) this.x.ranvia_idle();
   }
 
   usage() {
@@ -220,7 +241,15 @@ function createRanvia(cfg = {}) {
     }
     const ms = timeoutMs || (isEng ? 600e3 : 30e3);
     const res = await fetch(base + urlPath, { method, headers, body, signal: AbortSignal.timeout(ms) });
-    return { status: res.status, body: Buffer.from(await res.arrayBuffer()), etag: res.headers.get('etag') || '', headers: res.headers };
+    // Only a refusal the service signed for this request shuts the
+    // engine down; one from anything in between is temporary.
+    let shutdown = false;
+    if (isTerminalAuthStatus(res.status)) {
+      const want = Buffer.from(shutdownTag(key.secret, key.id, res.status, headers['Ranvia-Nonce']));
+      const got = Buffer.from(res.headers.get('ranvia-shutdown') || '');
+      shutdown = got.length === want.length && crypto.timingSafeEqual(got, want);
+    }
+    return { status: res.status, body: Buffer.from(await res.arrayBuffer()), etag: res.headers.get('etag') || '', headers: res.headers, shutdown };
   }
 
   function open(sealed) {
@@ -309,7 +338,7 @@ function createRanvia(cfg = {}) {
       }
       throw new Error('ranvia: engine download: ' + err.message);
     }
-    if (isTerminalAuthStatus(res.status)) {
+    if (res.shutdown) {
       if (cached.sealed) cached.sealed.fill(0);
       await deactivate(res.status, res.body.toString('utf8').trim());
       const inactive = new Error('ranvia: site key or plan is inactive');
@@ -358,7 +387,7 @@ function createRanvia(cfg = {}) {
     const v = target.rulesVersion();
     const extra = target.boxToken ? { 'Ranvia-Box': target.boxToken } : null;
     const res = await service('GET', '/v1/rules', null, v ? '"' + v + '"' : '', extra);
-    if (isTerminalAuthStatus(res.status)) {
+    if (res.shutdown) {
       await deactivate(res.status, res.body.toString('utf8').trim());
       return;
     }
@@ -374,6 +403,10 @@ function createRanvia(cfg = {}) {
     if (!req.length) return;
     const extra = target.boxToken ? { 'Ranvia-Box': target.boxToken } : null;
     const res = await service('POST', '/v1/posture', req, '', extra);
+    if (res.shutdown) {
+      await deactivate(res.status, res.body.toString('utf8').trim());
+      return;
+    }
     if (res.status === 200 && res.body.length) target.applyPosture(res.body);
   }
 
@@ -385,6 +418,12 @@ function createRanvia(cfg = {}) {
       upstream = await service('POST', '/v1/hard', payload, '', extra, HARD_TIMEOUT);
     } catch {
       upstream = null;
+    }
+    if (upstream && upstream.shutdown) {
+      await deactivate(upstream.status, upstream.body.toString('utf8').trim());
+      res.statusCode = 503;
+      res.end();
+      return;
     }
     if (!upstream || upstream.status >= 500) {
       const fb = target.hardFallback(hardCtx);
@@ -418,6 +457,10 @@ function createRanvia(cfg = {}) {
     if (!rep.length) return;
     try {
       const res = await service('POST', '/v1/usage', rep);
+      if (res.shutdown) {
+        await deactivate(res.status, res.body.toString('utf8').trim());
+        return;
+      }
       if (res.status >= 500) e.usageBack(rep);
     } catch {
       e.usageBack(rep);
@@ -450,6 +493,9 @@ function createRanvia(cfg = {}) {
     if (closed) return;
     try { await refreshRules(); } catch (err) { if (!err.inactive) log(err.message); }
     every(RULES_EVERY, () => refreshRules());
+    every(IDLE_EVERY, async () => {
+      if (engine) engine.idle();
+    });
     every(USAGE_EVERY, async () => {
       if (!engine) return;
       engine.tick();
